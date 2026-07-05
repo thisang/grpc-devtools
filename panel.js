@@ -33,26 +33,22 @@
 
   // ─── Connect to background ────────────────────────────────────
 
+  const tabId = chrome.devtools.inspectedWindow.tabId;
+  console.log('[gRPC DevTools] Panel init, tabId:', tabId);
+
   function connectPort() {
-    const tabId = chrome.devtools.inspectedWindow.tabId;
-    console.log('[gRPC DevTools] Panel connecting for tabId:', tabId);
+    console.log('[gRPC DevTools] Panel connecting...');
     panelPort = chrome.runtime.connect({ name: 'grpc-panel-' + tabId });
 
     panelPort.onMessage.addListener((msg) => {
-      console.log('[gRPC DevTools] Panel received message:', msg.type, msg);
+      console.log('[gRPC DevTools] Panel port message:', msg.type);
       if (msg.type === 'init') {
-        requests = msg.requests || [];
-        console.log('[gRPC DevTools] Panel init with', requests.length, 'existing requests');
-        renderRequestList();
-        updateCount();
+        syncRequests(msg.requests || []);
       } else if (msg.type === 'new-request') {
         if (recording) {
           requests.push(msg.request);
-          console.log('[gRPC DevTools] New request received, total:', requests.length, msg.request.url);
           renderRequestList();
           updateCount();
-        } else {
-          console.log('[gRPC DevTools] Skipped (not recording)');
         }
       } else if (msg.type === 'cleared') {
         requests = [];
@@ -63,12 +59,58 @@
     });
 
     panelPort.onDisconnect.addListener(() => {
-      console.log('[gRPC DevTools] Panel disconnected, reconnecting...');
-      setTimeout(connectPort, 1000);
+      console.log('[gRPC DevTools] Panel port disconnected');
+      panelPort = null;
     });
   }
 
   connectPort();
+
+  // ─── Poll for requests (robust against SW restarts) ──────────
+  // MV3 service workers get killed after ~30s of inactivity, which
+  // kills the port and wipes in-memory state. Polling get-requests
+  // ensures we always pick up new data even after SW restart.
+
+  let lastRequestCount = 0;
+  let pollTimer = null;
+
+  function pollRequests() {
+    chrome.runtime.sendMessage({ type: 'get-requests', tabId }, (response) => {
+      if (chrome.runtime.lastError) {
+        // SW might be restarting, try again next interval
+        return;
+      }
+      if (response && response.requests) {
+        syncRequests(response.requests);
+      }
+    });
+  }
+
+  function syncRequests(serverRequests) {
+    if (!serverRequests) return;
+
+    // Only re-render if something changed
+    if (serverRequests.length !== requests.length) {
+      console.log('[gRPC DevTools] Sync: ' + requests.length + ' → ' + serverRequests.length + ' requests');
+      requests = serverRequests;
+      renderRequestList();
+      updateCount();
+    } else if (serverRequests.length > 0) {
+      // Check if last request ID changed (new request with same count after clear)
+      const lastOld = requests[requests.length - 1]?.id;
+      const lastNew = serverRequests[serverRequests.length - 1]?.id;
+      if (lastOld !== lastNew) {
+        requests = serverRequests;
+        renderRequestList();
+        updateCount();
+      }
+    }
+  }
+
+  // Poll every 1 second
+  pollTimer = setInterval(pollRequests, 1000);
+  // Also poll immediately
+  pollRequests();
 
   // ─── Load AI config ───────────────────────────────────────────
 
