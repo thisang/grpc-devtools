@@ -1,336 +1,368 @@
 /**
- * Content script (runs in MAIN world)
- * Hooks fetch() and XMLHttpRequest to intercept gRPC / gRPC-Web traffic.
- * Sends captured binary payloads to the background service worker.
+ * Content script (ISOLATED world)
+ * Bridges between page-context hooks and background service worker.
+ *
+ * Architecture:
+ *   1. Inject page-script.js into page MAIN world (has access to fetch/XHR)
+ *   2. page-script hooks fetch()/XMLHttpRequest, detects gRPC traffic
+ *   3. page-script sends captured data via window.postMessage
+ *   4. This content script (ISOLATED) listens for postMessage events
+ *   5. Forwards data to background via chrome.runtime.sendMessage
  */
 
 (function () {
   'use strict';
 
-  // Avoid double-injection
-  if (window.__GRPC_DEVTOOLS_HOOKED__) return;
-  window.__GRPC_DEVTOOLS_HOOKED__ = true;
+  if (window.__GRPC_DEVTOOLS_ISOLATED__) return;
+  window.__GRPC_DEVTOOLS_ISOLATED__ = true;
 
-  const CONTENT_TYPE_GRPC = 'application/grpc';
-  const CONTENT_TYPE_GRPC_PROTO = 'application/grpc+proto';
-  const CONTENT_TYPE_GRPC_JSON = 'application/grpc+json';
-  const CONTENT_TYPE_GRPC_WEB = 'application/grpc-web';
-  const CONTENT_TYPE_GRPC_WEB_PROTO = 'application/grpc-web+proto';
-  const CONTENT_TYPE_GRPC_WEB_TEXT = 'application/grpc-web-text';
-  const CONTENT_TYPE_CONNECT_PROTO = 'application/connect+proto';
-  const CONTENT_TYPE_CONNECT_JSON = 'application/connect+json';
-  const CONTENT_TYPE_PROTO = 'application/proto';
-  const CONTENT_TYPE_PROTOBUF = 'application/x-protobuf';
+  console.log('[gRPC DevTools] Content script (isolated) loaded');
 
-  const GRPC_CONTENT_TYPES = new Set([
-    CONTENT_TYPE_GRPC,
-    CONTENT_TYPE_GRPC_PROTO,
-    CONTENT_TYPE_GRPC_JSON,
-    CONTENT_TYPE_GRPC_WEB,
-    CONTENT_TYPE_GRPC_WEB_PROTO,
-    CONTENT_TYPE_GRPC_WEB_TEXT,
-    CONTENT_TYPE_CONNECT_PROTO,
-    CONTENT_TYPE_CONNECT_JSON,
-    CONTENT_TYPE_PROTO,
-    CONTENT_TYPE_PROTOBUF,
-  ]);
+  // ─── Listen for messages from page-context hooks ──────────────
 
-  const GRPC_WEB_TEXT_TYPES = new Set([
-    CONTENT_TYPE_GRPC_WEB_TEXT,
-  ]);
+  window.addEventListener('message', (event) => {
+    // Only accept messages from the same window, tagged by our extension
+    if (event.source !== window) return;
+    if (!event.data || event.data.source !== 'grpc-devtools') return;
 
-  const DEBUG = false; // Set to true for verbose console logging
+    const payload = event.data.payload;
+    if (!payload) return;
 
-  /**
-   * Check if a content-type header indicates gRPC traffic
-   */
-  function isGrpcContentType(contentType) {
-    if (!contentType) return false;
-    const ct = contentType.toLowerCase().split(';')[0].trim();
-    return GRPC_CONTENT_TYPES.has(ct);
-  }
-
-  /**
-   * Check if content-type indicates grpc-web-text (base64 encoded)
-   */
-  function isGrpcWebText(contentType) {
-    if (!contentType) return false;
-    const ct = contentType.toLowerCase().split(';')[0].trim();
-    return GRPC_WEB_TEXT_TYPES.has(ct);
-  }
-
-  /**
-   * Check if a URL looks like a gRPC endpoint (heuristic)
-   */
-  function looksLikeGrpcPath(url) {
-    try {
-      const u = new URL(url);
-      // gRPC-Web typically uses paths like /package.Service/Method
-      const parts = u.pathname.split('/').filter(Boolean);
-      if (parts.length >= 2) {
-        const servicePart = parts[parts.length - 2];
-        const methodPart = parts[parts.length - 1];
-        // Service names usually contain a dot: package.ServiceName
-        if (servicePart.includes('.')) return true;
-        // Method names often start with uppercase (gRPC convention)
-        if (/^[A-Z]/.test(methodPart) && /^[A-Za-z]/.test(servicePart)) return true;
+    if (payload.type === 'grpc-request') {
+      try {
+        chrome.runtime.sendMessage({
+          type: 'grpc-request',
+          request: payload.request,
+        }, (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[gRPC DevTools] sendMessage error:', chrome.runtime.lastError.message);
+          }
+        });
+      } catch (e) {
+        console.warn('[gRPC DevTools] Failed to forward capture:', e);
       }
-      return false;
-    } catch {
-      return false;
     }
+  });
+
+  // ─── Inject page-context hook script ──────────────────────────
+
+  function injectScript() {
+    const script = document.createElement('script');
+    script.textContent = '(' + pageScript.toString() + ')()';
+    (document.head || document.documentElement).appendChild(script);
+    script.remove();
   }
 
-  /**
-   * Check if the headers suggest binary/protobuf payload
-   */
-  function hasBinaryHeaders(headers) {
-    if (!headers) return false;
-    const ct = (headers['content-type'] || '').toLowerCase();
-    // Also check for accept headers
-    const accept = (headers['accept'] || '').toLowerCase();
-    return (
-      ct.includes('proto') ||
-      ct.includes('grpc') ||
-      ct.includes('octet-stream') ||
-      accept.includes('grpc') ||
-      accept.includes('proto')
-    );
+  // Inject as early as possible to hook fetch before page code runs
+  if (document.head || document.documentElement) {
+    injectScript();
+  } else {
+    document.addEventListener('DOMContentLoaded', injectScript);
   }
 
-  /**
-   * Combined check: is this likely a gRPC call?
-   */
-  function isGrpcRequest(url, requestHeaders, responseHeaders) {
-    const resCt = responseHeaders?.['content-type'];
-    const reqCt = requestHeaders?.['content-type'];
+  // ─── Page-context script (runs in MAIN world) ─────────────────
 
-    // Exact content-type match
-    if (isGrpcContentType(resCt) || isGrpcContentType(reqCt)) return true;
+  function pageScript() {
+    'use strict';
 
-    // Path-based heuristic
-    if (looksLikeGrpcPath(url)) return true;
+    // Avoid double-injection
+    if (window.__GRPC_DEVTOOLS_PAGE_HOOKED__) return;
+    window.__GRPC_DEVTOOLS_PAGE_HOOKED__ = true;
 
-    // Binary headers + method=POST on a non-RESTful path
-    if (hasBinaryHeaders(requestHeaders) && looksLikeGrpcPath(url)) return true;
+    const CONTENT_TYPE_GRPC = 'application/grpc';
+    const CONTENT_TYPE_GRPC_PROTO = 'application/grpc+proto';
+    const CONTENT_TYPE_GRPC_JSON = 'application/grpc+json';
+    const CONTENT_TYPE_GRPC_WEB = 'application/grpc-web';
+    const CONTENT_TYPE_GRPC_WEB_PROTO = 'application/grpc-web+proto';
+    const CONTENT_TYPE_GRPC_WEB_TEXT = 'application/grpc-web-text';
+    const CONTENT_TYPE_CONNECT_PROTO = 'application/connect+proto';
+    const CONTENT_TYPE_CONNECT_JSON = 'application/connect+json';
+    const CONTENT_TYPE_PROTO = 'application/proto';
+    const CONTENT_TYPE_PROTOBUF = 'application/x-protobuf';
 
-    return false;
-  }
+    const GRPC_CONTENT_TYPES = new Set([
+      CONTENT_TYPE_GRPC,
+      CONTENT_TYPE_GRPC_PROTO,
+      CONTENT_TYPE_GRPC_JSON,
+      CONTENT_TYPE_GRPC_WEB,
+      CONTENT_TYPE_GRPC_WEB_PROTO,
+      CONTENT_TYPE_GRPC_WEB_TEXT,
+      CONTENT_TYPE_CONNECT_PROTO,
+      CONTENT_TYPE_CONNECT_JSON,
+      CONTENT_TYPE_PROTO,
+      CONTENT_TYPE_PROTOBUF,
+    ]);
 
-  /**
-   * Extract gRPC status and message from trailers/response headers
-   */
-  function extractGrpcStatus(headers) {
-    const status = headers['grpc-status'];
-    const message = headers['grpc-message'];
-    if (status != null) {
-      return {
-        code: parseInt(status, 10),
-        message: message ? decodeURIComponent(message) : undefined,
-      };
+    const GRPC_WEB_TEXT_TYPES = new Set([
+      CONTENT_TYPE_GRPC_WEB_TEXT,
+    ]);
+
+    // ─── Utilities ───────────────────────────────────────────────
+
+    function isGrpcContentType(contentType) {
+      if (!contentType) return false;
+      const ct = contentType.toLowerCase().split(';')[0].trim();
+      return GRPC_CONTENT_TYPES.has(ct);
     }
-    return undefined;
-  }
 
-  /**
-   * Convert ArrayBuffer / Uint8Array to base64 string
-   */
-  function arrayBufferToBase64(buffer) {
-    const bytes = new Uint8Array(buffer);
-    let binary = '';
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      const chunk = bytes.subarray(i, i + chunkSize);
-      binary += String.fromCharCode.apply(null, chunk);
+    function isGrpcWebText(contentType) {
+      if (!contentType) return false;
+      const ct = contentType.toLowerCase().split(';')[0].trim();
+      return GRPC_WEB_TEXT_TYPES.has(ct);
     }
-    return btoa(binary);
-  }
 
-  /**
-   * Decode grpc-web-text (base64 encoded) to raw bytes
-   */
-  function decodeGrpcWebText(buffer) {
-    try {
-      const bytes = new Uint8Array(buffer);
-      let binary = '';
-      for (let i = 0; i < bytes.length; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const decoded = atob(binary);
-      const result = new Uint8Array(decoded.length);
-      for (let i = 0; i < decoded.length; i++) {
-        result[i] = decoded.charCodeAt(i);
-      }
-      return result.buffer;
-    } catch {
-      return buffer;
-    }
-  }
-
-  /**
-   * Parse gRPC frame: [compressed flag (1 byte)] [length (4 bytes BE)] [payload]
-   * Returns array of raw protobuf payloads
-   */
-  function parseGrpcFrames(buffer) {
-    const frames = [];
-    const view = new DataView(buffer);
-    let offset = 0;
-
-    while (offset + 5 <= buffer.byteLength) {
-      const compressed = view.getUint8(offset);
-      const length = view.getUint32(offset + 1, false); // big-endian
-      offset += 5;
-
-      if (offset + length > buffer.byteLength) {
-        // Incomplete frame, grab what's available
-        const remaining = buffer.byteLength - offset;
-        if (remaining > 0) {
-          frames.push({
-            compressed: compressed === 1,
-            data: arrayBufferToBase64(buffer.slice(offset, offset + remaining)),
-            truncated: true,
-          });
+    function looksLikeGrpcPath(url) {
+      try {
+        const u = new URL(url, location.origin);
+        const parts = u.pathname.split('/').filter(Boolean);
+        if (parts.length >= 2) {
+          const servicePart = parts[parts.length - 2];
+          const methodPart = parts[parts.length - 1];
+          if (servicePart.includes('.')) return true;
+          if (/^[A-Z]/.test(methodPart) && /^[A-Za-z]/.test(servicePart)) return true;
         }
-        break;
+        return false;
+      } catch {
+        return false;
       }
-
-      frames.push({
-        compressed: compressed === 1,
-        data: arrayBufferToBase64(buffer.slice(offset, offset + length)),
-        truncated: false,
-      });
-      offset += length;
     }
 
-    return frames;
-  }
+    function hasBinaryHeaders(headers) {
+      if (!headers) return false;
+      var ct = (headers['content-type'] || '').toLowerCase();
+      var accept = (headers['accept'] || '').toLowerCase();
+      return (
+        ct.indexOf('proto') !== -1 ||
+        ct.indexOf('grpc') !== -1 ||
+        ct.indexOf('octet-stream') !== -1 ||
+        accept.indexOf('grpc') !== -1 ||
+        accept.indexOf('proto') !== -1
+      );
+    }
 
-  /**
-   * Build and send a capture record to background
-   */
-  function captureRequest(record) {
-    try {
-      chrome.runtime.sendMessage({
+    function isGrpcRequest(url, requestHeaders, responseHeaders) {
+      var resCt = responseHeaders ? responseHeaders['content-type'] : null;
+      var reqCt = requestHeaders ? requestHeaders['content-type'] : null;
+      if (isGrpcContentType(resCt) || isGrpcContentType(reqCt)) return true;
+      if (looksLikeGrpcPath(url)) return true;
+      if (hasBinaryHeaders(requestHeaders) && looksLikeGrpcPath(url)) return true;
+      return false;
+    }
+
+    function extractGrpcStatus(headers) {
+      var status = headers['grpc-status'];
+      var message = headers['grpc-message'];
+      if (status != null) {
+        return {
+          code: parseInt(status, 10),
+          message: message ? decodeURIComponent(message) : undefined,
+        };
+      }
+      return undefined;
+    }
+
+    function arrayBufferToBase64(buffer) {
+      var bytes = new Uint8Array(buffer);
+      var binary = '';
+      var chunkSize = 0x8000;
+      for (var i = 0; i < bytes.length; i += chunkSize) {
+        var chunk = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, chunk);
+      }
+      return btoa(binary);
+    }
+
+    function decodeGrpcWebText(buffer) {
+      try {
+        var bytes = new Uint8Array(buffer);
+        var binary = '';
+        for (var i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        var decoded = atob(binary);
+        var result = new Uint8Array(decoded.length);
+        for (var i = 0; i < decoded.length; i++) {
+          result[i] = decoded.charCodeAt(i);
+        }
+        return result.buffer;
+      } catch {
+        return buffer;
+      }
+    }
+
+    function parseGrpcFrames(buffer) {
+      var frames = [];
+      var view = new DataView(buffer);
+      var offset = 0;
+
+      while (offset + 5 <= buffer.byteLength) {
+        var compressed = view.getUint8(offset);
+        var length = view.getUint32(offset + 1, false);
+        offset += 5;
+
+        if (offset + length > buffer.byteLength) {
+          var remaining = buffer.byteLength - offset;
+          if (remaining > 0) {
+            frames.push({
+              compressed: compressed === 1,
+              data: arrayBufferToBase64(buffer.slice(offset, offset + remaining)),
+              truncated: true,
+            });
+          }
+          break;
+        }
+
+        frames.push({
+          compressed: compressed === 1,
+          data: arrayBufferToBase64(buffer.slice(offset, offset + length)),
+          truncated: false,
+        });
+        offset += length;
+      }
+
+      return frames;
+    }
+
+    function headerToLower(obj) {
+      if (!obj) return {};
+      var result = {};
+      for (var k in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj, k)) {
+          result[k.toLowerCase ? k.toLowerCase() : String(k).toLowerCase()] = obj[k];
+        }
+      }
+      return result;
+    }
+
+    // ─── Send to ISOLATED world via postMessage ──────────────────
+
+    function sendToExtension(data) {
+      try {
+        window.postMessage({
+          source: 'grpc-devtools',
+          payload: data,
+        }, '*');
+      } catch (e) {
+        // silently fail
+      }
+    }
+
+    function processResponse(url, method, requestHeaders, requestBody, response) {
+      var isGrpc = isGrpcRequest(url, requestHeaders, response.headers);
+      if (!isGrpc) return;
+
+      var rawBody = response.body;
+      if (isGrpcWebText(response.headers['content-type'])) {
+        rawBody = decodeGrpcWebText(rawBody);
+      }
+
+      var responseFrames = parseGrpcFrames(rawBody);
+      var grpcStatus = extractGrpcStatus(response.headers);
+
+      var requestFrames = [];
+      if (requestBody) {
+        var reqRaw = requestBody;
+        if (isGrpcWebText(requestHeaders['content-type'])) {
+          reqRaw = decodeGrpcWebText(requestBody);
+        }
+        requestFrames = parseGrpcFrames(reqRaw);
+      }
+
+      var serviceName = '';
+      var methodName = '';
+      try {
+        var u = new URL(url, location.origin);
+        var parts = u.pathname.split('/').filter(Boolean);
+        if (parts.length >= 2) {
+          serviceName = parts[parts.length - 2];
+          methodName = parts[parts.length - 1];
+        }
+      } catch {
+        // ignore
+      }
+
+      // Normalize header keys to lowercase
+      var normReqHeaders = {};
+      if (requestHeaders) {
+        Object.keys(requestHeaders).forEach(function (k) {
+          normReqHeaders[k.toLowerCase()] = requestHeaders[k];
+        });
+      }
+      var normResHeaders = {};
+      if (response.headers) {
+        Object.keys(response.headers).forEach(function (k) {
+          normResHeaders[k.toLowerCase()] = response.headers[k];
+        });
+      }
+
+      sendToExtension({
         type: 'grpc-request',
-        request: record,
+        request: {
+          id: Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+          timestamp: Date.now(),
+          url: url,
+          method: method,
+          serviceName: serviceName,
+          methodName: methodName,
+          requestHeaders: normReqHeaders,
+          requestFrames: requestFrames,
+          responseStatus: response.status,
+          responseStatusText: response.statusText,
+          responseHeaders: normResHeaders,
+          responseFrames: responseFrames,
+          grpcStatus: grpcStatus,
+          duration: response.duration,
+        },
       });
-      if (DEBUG) console.debug('[gRPC DevTools] Captured request:', record.serviceName + '/' + record.methodName, record.url);
-    } catch (e) {
-      console.warn('[gRPC DevTools] Failed to send capture:', e);
-    }
-  }
-
-  /**
-   * Process a fetch response or XHR response
-   */
-  function processResponse(url, method, requestHeaders, requestBody, response) {
-    // response: { status, statusText, headers, body (ArrayBuffer) }
-    const isGrpc = isGrpcRequest(url, requestHeaders, response.headers);
-
-    if (!isGrpc) {
-      if (DEBUG) console.debug('[gRPC DevTools] Skipped non-gRPC request:', url);
-      return;
     }
 
-    let rawBody = response.body;
-    if (isGrpcWebText(response.headers['content-type'])) {
-      rawBody = decodeGrpcWebText(rawBody);
-    }
+    // ─── Hook fetch() ────────────────────────────────────────────
 
-    const responseFrames = parseGrpcFrames(rawBody);
-    const grpcStatus = extractGrpcStatus(response.headers);
+    var originalFetch = window.fetch;
+    window.fetch = function (input, init) {
+      var url = typeof input === 'string' ? input : (input && input.url);
+      if (!url) return originalFetch.apply(this, arguments);
+      var method = (init && init.method) || (typeof input !== 'string' && input ? input.method : 'GET') || 'GET';
 
-    // Parse request body frames too
-    let requestFrames = [];
-    if (requestBody) {
-      let reqRaw = requestBody;
-      if (isGrpcWebText(requestHeaders['content-type'])) {
-        reqRaw = decodeGrpcWebText(requestBody);
+      // Capture request headers
+      var requestHeaders = {};
+      if (init && init.headers) {
+        if (init.headers instanceof Headers) {
+          init.headers.forEach(function (v, k) { requestHeaders[k] = v; });
+        } else if (Array.isArray(init.headers)) {
+          init.headers.forEach(function (pair) { requestHeaders[pair[0]] = pair[1]; });
+        } else if (typeof init.headers === 'object') {
+          Object.keys(init.headers).forEach(function (k) { requestHeaders[k] = init.headers[k]; });
+        }
       }
-      requestFrames = parseGrpcFrames(reqRaw);
-    }
 
-    // Extract service and method from URL path
-    let serviceName = '';
-    let methodName = '';
-    try {
-      const u = new URL(url);
-      const parts = u.pathname.split('/').filter(Boolean);
-      if (parts.length >= 2) {
-        serviceName = parts[parts.length - 2];
-        methodName = parts[parts.length - 1];
+      // Capture request body
+      var requestBodyBuffer = null;
+      var bodyPromise = Promise.resolve(null);
+      if (init && init.body) {
+        if (init.body instanceof ArrayBuffer) {
+          requestBodyBuffer = init.body;
+        } else if (init.body instanceof Uint8Array) {
+          requestBodyBuffer = init.body.buffer;
+        } else if (init.body instanceof Blob) {
+          bodyPromise = init.body.arrayBuffer().then(function (buf) { requestBodyBuffer = buf; });
+        } else if (typeof init.body === 'string') {
+          requestBodyBuffer = new TextEncoder().encode(init.body).buffer;
+        }
       }
-    } catch {
-      // ignore
-    }
 
-    captureRequest({
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: Date.now(),
-      url: url,
-      method: method,
-      serviceName: serviceName,
-      methodName: methodName,
-      requestHeaders: requestHeaders,
-      requestFrames: requestFrames,
-      responseStatus: response.status,
-      responseStatusText: response.statusText,
-      responseHeaders: response.headers,
-      responseFrames: responseFrames,
-      grpcStatus: grpcStatus,
-      duration: response.duration,
-    });
-  }
+      var startTime = performance.now();
 
-  // ─── Hook fetch() ──────────────────────────────────────────────
+      return bodyPromise.then(function () {
+        return originalFetch.apply(this, arguments);
+      }.bind(this)).then(function (response) {
+        // Only process gRPC requests (check before consuming body)
+        if (!isGrpcRequest(url, requestHeaders, null)) return response;
 
-  const originalFetch = window.fetch;
-  window.fetch = async function (input, init) {
-    const url = typeof input === 'string' ? input : input?.url;
-    const method = init?.method || (typeof input !== 'string' ? input?.method : 'GET') || 'GET';
-
-    // Capture request headers
-    const requestHeaders = {};
-    if (init?.headers) {
-      if (init.headers instanceof Headers) {
-        init.headers.forEach((v, k) => { requestHeaders[k] = v; });
-      } else if (Array.isArray(init.headers)) {
-        init.headers.forEach(([k, v]) => { requestHeaders[k] = v; });
-      } else if (typeof init.headers === 'object') {
-        Object.assign(requestHeaders, init.headers);
-      }
-    }
-
-    // Capture request body
-    let requestBodyBuffer = null;
-    if (init?.body) {
-      if (init.body instanceof ArrayBuffer) {
-        requestBodyBuffer = init.body;
-      } else if (init.body instanceof Uint8Array) {
-        requestBodyBuffer = init.body.buffer;
-      } else if (init.body instanceof Blob) {
-        requestBodyBuffer = await init.body.arrayBuffer();
-      } else if (typeof init.body === 'string') {
-        requestBodyBuffer = new TextEncoder().encode(init.body).buffer;
-      }
-    }
-
-    const startTime = performance.now();
-
-    try {
-      const response = await originalFetch.apply(this, arguments);
-
-      // Clone the response to read its body without consuming it
-      const cloned = response.clone();
-      const contentType = response.headers.get('content-type') || '';
-
-      const isGrpc = isGrpcRequest(url, requestHeaders, null);
-
-      if (isGrpc) {
-        try {
-          const bodyBuffer = await cloned.arrayBuffer();
-          const responseHeaders = {};
-          cloned.headers.forEach((v, k) => { responseHeaders[k] = v; });
+        var cloned = response.clone();
+        return cloned.arrayBuffer().then(function (bodyBuffer) {
+          var responseHeaders = {};
+          cloned.headers.forEach(function (v, k) { responseHeaders[k] = v; });
 
           processResponse(url, method, requestHeaders, requestBodyBuffer, {
             status: response.status,
@@ -339,131 +371,129 @@
             body: bodyBuffer,
             duration: performance.now() - startTime,
           });
-        } catch (err) {
-          console.warn('[gRPC DevTools] Failed to process gRPC response:', err);
-        }
-      }
-
-      return response;
-    } catch (err) {
-      // If it's a gRPC request that errored, capture the error
-      if (isGrpcRequest(url, requestHeaders, null)) {
-        captureRequest({
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          timestamp: Date.now(),
-          url: url,
-          method: method,
-          serviceName: '',
-          methodName: '',
-          requestHeaders: requestHeaders,
-          requestFrames: requestBodyBuffer ? parseGrpcFrames(
-            requestHeaders['content-type']?.includes('grpc-web-text')
-              ? decodeGrpcWebText(requestBodyBuffer)
-              : requestBodyBuffer
-          ) : [],
-          responseStatus: 0,
-          responseStatusText: 'Network Error',
-          responseHeaders: {},
-          responseFrames: [],
-          grpcStatus: { code: 14, message: err?.message || 'Network error' },
-          duration: performance.now() - startTime,
-          error: true,
+        }).catch(function (err) {
+          console.warn('[gRPC DevTools] Failed to process fetch response:', err);
+        }).then(function () {
+          return response;
         });
-      }
-      throw err;
-    }
-  };
-
-  // ─── Hook XMLHttpRequest ───────────────────────────────────────
-
-  const originalOpen = XMLHttpRequest.prototype.open;
-  const originalSend = XMLHttpRequest.prototype.send;
-  const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
-
-  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    this.__grpc_url = url;
-    this.__grpc_method = method;
-    this.__grpc_requestHeaders = {};
-    this.__grpc_startTime = 0;
-    return originalOpen.call(this, method, url, ...rest);
-  };
-
-  XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-    if (this.__grpc_requestHeaders) {
-      this.__grpc_requestHeaders[name] = value;
-    }
-    return originalSetRequestHeader.call(this, name, value);
-  };
-
-  XMLHttpRequest.prototype.send = function (body) {
-    this.__grpc_startTime = performance.now();
-
-    // Capture request body
-    let requestBodyBuffer = null;
-    if (body) {
-      if (body instanceof ArrayBuffer) {
-        requestBodyBuffer = body;
-      } else if (body instanceof Uint8Array) {
-        requestBodyBuffer = body.buffer;
-      } else if (body instanceof Blob) {
-        // Blob needs async; capture URL for now
-        body.arrayBuffer().then(buf => { this.__grpc_requestBody = buf; });
-      } else if (typeof body === 'string') {
-        requestBodyBuffer = new TextEncoder().encode(body).buffer;
-      }
-    }
-    this.__grpc_requestBody = requestBodyBuffer;
-
-    const self = this;
-
-    this.addEventListener('loadend', function () {
-      const url = self.__grpc_url;
-      const method = self.__grpc_method;
-      const requestHeaders = self.__grpc_requestHeaders || {};
-
-      // Get response headers first
-      const responseHeaders = {};
-      const rawHeaders = self.getAllResponseHeaders();
-      if (rawHeaders) {
-        rawHeaders.split('\r\n').forEach(line => {
-          const idx = line.indexOf(': ');
-          if (idx > 0) {
-            responseHeaders[line.substring(0, idx).toLowerCase()] = line.substring(idx + 2);
-          }
-        });
-      }
-
-      const isGrpc = isGrpcRequest(url, requestHeaders, responseHeaders);
-
-      if (!isGrpc) return;
-
-      // Get response body as ArrayBuffer
-      let bodyBuffer;
-      try {
-        if (self.responseType === 'arraybuffer' || self.responseType === '') {
-          if (self.response instanceof ArrayBuffer) {
-            bodyBuffer = self.response;
-          } else if (self.responseType === '' && typeof self.response === 'string') {
-            bodyBuffer = new TextEncoder().encode(self.response).buffer;
-          }
+      }).catch(function (err) {
+        // Capture network errors for gRPC requests
+        if (isGrpcRequest(url, requestHeaders, null)) {
+          sendToExtension({
+            type: 'grpc-request',
+            request: {
+              id: Date.now() + '-' + Math.random().toString(36).slice(2, 8),
+              timestamp: Date.now(),
+              url: url,
+              method: method,
+              serviceName: '',
+              methodName: '',
+              requestHeaders: requestHeaders,
+              requestFrames: [],
+              responseStatus: 0,
+              responseStatusText: 'Network Error',
+              responseHeaders: {},
+              responseFrames: [],
+              grpcStatus: { code: 14, message: (err && err.message) || 'Network error' },
+              duration: performance.now() - startTime,
+              error: true,
+            },
+          });
         }
-      } catch {
-        // ignore
-      }
-
-      if (!bodyBuffer) return;
-
-      processResponse(url, method, requestHeaders, self.__grpc_requestBody, {
-        status: self.status,
-        statusText: self.statusText,
-        headers: responseHeaders,
-        body: bodyBuffer,
-        duration: performance.now() - self.__grpc_startTime,
+        throw err;
       });
-    });
+    };
 
-    return originalSend.call(this, body);
-  };
+    // ─── Hook XMLHttpRequest ─────────────────────────────────────
 
-  console.log('[gRPC DevTools] Content script hooks installed. Supported content-types:', [...GRPC_CONTENT_TYPES].join(', '));
+    var originalOpen = XMLHttpRequest.prototype.open;
+    var originalSend = XMLHttpRequest.prototype.send;
+    var originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__grpc_url = url;
+      this.__grpc_method = method;
+      this.__grpc_requestHeaders = {};
+      this.__grpc_startTime = 0;
+      return originalOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      if (this.__grpc_requestHeaders) {
+        this.__grpc_requestHeaders[name] = value;
+      }
+      return originalSetRequestHeader.call(this, name, value);
+    };
+
+    XMLHttpRequest.prototype.send = function (body) {
+      this.__grpc_startTime = performance.now();
+
+      var requestBodyBuffer = null;
+      if (body) {
+        if (body instanceof ArrayBuffer) {
+          requestBodyBuffer = body;
+        } else if (body instanceof Uint8Array) {
+          requestBodyBuffer = body.buffer;
+        } else if (body instanceof Blob) {
+          body.arrayBuffer().then(function (buf) { this.__grpc_requestBody = buf; }.bind(this));
+        } else if (typeof body === 'string') {
+          requestBodyBuffer = new TextEncoder().encode(body).buffer;
+        }
+      }
+      this.__grpc_requestBody = requestBodyBuffer;
+
+      var self = this;
+
+      this.addEventListener('loadend', function () {
+        var url = self.__grpc_url;
+        var method = self.__grpc_method;
+        var requestHeaders = self.__grpc_requestHeaders || {};
+
+        var responseHeaders = {};
+        try {
+          var rawHeaders = self.getAllResponseHeaders();
+          if (rawHeaders) {
+            rawHeaders.split('\r\n').forEach(function (line) {
+              var idx = line.indexOf(': ');
+              if (idx > 0) {
+                responseHeaders[line.substring(0, idx).toLowerCase()] = line.substring(idx + 2);
+              }
+            });
+          }
+        } catch {
+          // ignore
+        }
+
+        if (!isGrpcRequest(url, requestHeaders, responseHeaders)) return;
+
+        var bodyBuffer;
+        try {
+          if (self.responseType === 'arraybuffer' || self.responseType === '') {
+            if (self.response instanceof ArrayBuffer) {
+              bodyBuffer = self.response;
+            } else if (self.responseType === '' && typeof self.response === 'string') {
+              bodyBuffer = new TextEncoder().encode(self.response).buffer;
+            }
+          }
+        } catch {
+          // ignore
+        }
+
+        if (!bodyBuffer) return;
+
+        processResponse(url, method, requestHeaders, self.__grpc_requestBody, {
+          status: self.status,
+          statusText: self.statusText,
+          headers: responseHeaders,
+          body: bodyBuffer,
+          duration: performance.now() - self.__grpc_startTime,
+        });
+      });
+
+      return originalSend.call(this, body);
+    };
+
+    console.log('[gRPC DevTools] Page hooks installed. Supported content-types: ' +
+      Array.from(GRPC_CONTENT_TYPES).join(', '));
+  }
 })();
