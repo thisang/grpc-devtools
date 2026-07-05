@@ -42,6 +42,7 @@
   let reconnectTimer = null;
   let reconnectDelay = 500;
   let pollTimer = null;
+  let protoMappings = {}; // { 'Service.Method': { request: {1:'name'}, response: {1:'message'} } }
 
   // ─── DOM refs (populated after DOMContentLoaded) ──────────────
   let requestList, detailPanel, searchInput, clearBtn, exportBtn;
@@ -242,6 +243,13 @@
     }
   }
 
+  function getFieldMapping(serviceName, methodName, isRequest) {
+    var key = serviceName + '.' + methodName;
+    var mapping = protoMappings[key];
+    if (!mapping) return null;
+    return isRequest ? mapping.request : mapping.response;
+  }
+
   function renderDetail(req) {
     if (!detailPanel) return;
     try {
@@ -250,11 +258,14 @@
         return;
       }
 
+      var reqMapping = getFieldMapping(req.serviceName, req.methodName, true);
+      var resMapping = getFieldMapping(req.serviceName, req.methodName, false);
+
       var reqDecoded = (req.requestFrames && req.requestFrames.length > 0)
-        ? decodeBase64Proto(req.requestFrames[0].data)
+        ? decodeBase64Proto(req.requestFrames[0].data, reqMapping)
         : null;
       var resDecoded = (req.responseFrames && req.responseFrames.length > 0)
-        ? decodeBase64Proto(req.responseFrames[0].data)
+        ? decodeBase64Proto(req.responseFrames[0].data, resMapping)
         : null;
 
       detailPanel.innerHTML =
@@ -557,6 +568,72 @@
           baseUrl: document.getElementById('aiBaseUrl').value,
         });
         aiModal.style.display = 'none';
+      });
+    }
+
+    // ─── Proto Schema ────────────────────────────────────────
+    var protoToggleBtn = document.getElementById('protoToggleBtn');
+    var protoContent = document.getElementById('protoContent');
+    var protoMapping = document.getElementById('protoMapping');
+    var protoApplyBtn = document.getElementById('protoApplyBtn');
+    var protoClearBtn = document.getElementById('protoClearBtn');
+
+    // Load saved proto mappings from chrome.storage.local
+    chrome.storage.local.get('grpcProtoMappings', function (result) {
+      if (result.grpcProtoMappings) {
+        try {
+          protoMappings = JSON.parse(result.grpcProtoMappings);
+          if (protoMapping) protoMapping.value = result.grpcProtoMappings;
+          console.log('[gRPC DevTools] Loaded proto mappings:', Object.keys(protoMappings).length, 'services');
+        } catch (e) {
+          console.warn('[gRPC DevTools] Failed to parse saved proto mappings:', e);
+        }
+      }
+    });
+
+    if (protoToggleBtn && protoContent) {
+      protoToggleBtn.addEventListener('click', function () {
+        var isHidden = protoContent.style.display === 'none';
+        protoContent.style.display = isHidden ? 'block' : 'none';
+        protoToggleBtn.textContent = isHidden ? '▲' : '▼';
+      });
+    }
+
+    if (protoApplyBtn && protoMapping) {
+      protoApplyBtn.addEventListener('click', function () {
+        try {
+          var text = protoMapping.value.trim();
+          if (!text) {
+            protoMappings = {};
+            chrome.storage.local.remove('grpcProtoMappings');
+            console.log('[gRPC DevTools] Proto mappings cleared');
+            return;
+          }
+          protoMappings = JSON.parse(text);
+          chrome.storage.local.set({ grpcProtoMappings: text });
+          console.log('[gRPC DevTools] Proto mappings applied:', Object.keys(protoMappings).length, 'services');
+          // Re-render selected request if any
+          if (selectedRequestId) {
+            var req = requests.find(function (r) { return r.id === selectedRequestId; });
+            if (req) renderDetail(req);
+          }
+        } catch (e) {
+          console.error('[gRPC DevTools] Failed to parse proto mapping:', e);
+          alert('Invalid JSON: ' + e.message);
+        }
+      });
+    }
+
+    if (protoClearBtn && protoMapping) {
+      protoClearBtn.addEventListener('click', function () {
+        protoMapping.value = '';
+        protoMappings = {};
+        chrome.storage.local.remove('grpcProtoMappings');
+        console.log('[gRPC DevTools] Proto mappings cleared');
+        if (selectedRequestId) {
+          var req = requests.find(function (r) { return r.id === selectedRequestId; });
+          if (req) renderDetail(req);
+        }
       });
     }
 

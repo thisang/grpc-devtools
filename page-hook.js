@@ -94,13 +94,16 @@
       for (var i = 0; i < bytes.length; i++) {
         binary += String.fromCharCode(bytes[i]);
       }
-      var decoded = atob(binary);
+      // Remove whitespace, newlines, and any non-base64 characters
+      var cleaned = binary.replace(/[^A-Za-z0-9+/=]/g, '');
+      var decoded = atob(cleaned);
       var result = new Uint8Array(decoded.length);
       for (var i = 0; i < decoded.length; i++) {
         result[i] = decoded.charCodeAt(i);
       }
       return result.buffer;
     } catch (e) {
+      console.log('[gRPC DevTools] decodeGrpcWebText failed, returning raw buffer');
       return buffer;
     }
   }
@@ -112,6 +115,17 @@
     while (offset + 5 <= buffer.byteLength) {
       var compressed = view.getUint8(offset);
       var length = view.getUint32(offset + 1, false);
+      // Sanity check: if length is unreasonably large, treat as raw protobuf
+      if (length > buffer.byteLength - 5) {
+        if (offset === 0) {
+          frames.push({
+            compressed: false,
+            data: arrayBufferToBase64(buffer.slice(offset)),
+            truncated: false
+          });
+        }
+        break;
+      }
       offset += 5;
       if (offset + length > buffer.byteLength) {
         var remaining = buffer.byteLength - offset;
@@ -162,19 +176,41 @@
 
     var rawBody = response.body;
     if (isGrpcWebText(response.headers['content-type'])) {
+      console.log('[gRPC DevTools] Decoding grpc-web-text response, body size:', rawBody ? rawBody.byteLength : 0);
       rawBody = decodeGrpcWebText(rawBody);
+      console.log('[gRPC DevTools] Decoded grpc-web-text response, rawBody size:', rawBody ? rawBody.byteLength : 0);
     }
 
     var responseFrames = parseGrpcFrames(rawBody);
+    console.log('[gRPC DevTools] Parsed response frames:', responseFrames.length);
+    if (responseFrames.length === 0 && rawBody && rawBody.byteLength > 0) {
+      console.log('[gRPC DevTools] No frames parsed, treating raw body as single protobuf frame');
+      responseFrames = [{
+        compressed: false,
+        data: arrayBufferToBase64(rawBody),
+        truncated: false
+      }];
+    }
     var grpcStatus = extractGrpcStatus(response.headers);
 
     var requestFrames = [];
     if (requestBody) {
       var reqRaw = requestBody;
       if (isGrpcWebText(requestHeaders['content-type'])) {
+        console.log('[gRPC DevTools] Decoding grpc-web-text request, body size:', reqRaw ? reqRaw.byteLength : 0);
         reqRaw = decodeGrpcWebText(requestBody);
+        console.log('[gRPC DevTools] Decoded grpc-web-text request, reqRaw size:', reqRaw ? reqRaw.byteLength : 0);
       }
       requestFrames = parseGrpcFrames(reqRaw);
+      console.log('[gRPC DevTools] Parsed request frames:', requestFrames.length);
+      if (requestFrames.length === 0 && reqRaw && reqRaw.byteLength > 0) {
+        console.log('[gRPC DevTools] No request frames parsed, treating raw body as single protobuf frame');
+        requestFrames = [{
+          compressed: false,
+          data: arrayBufferToBase64(reqRaw),
+          truncated: false
+        }];
+      }
     }
 
     var serviceName = '';
@@ -190,6 +226,7 @@
       // ignore
     }
 
+    console.log('[gRPC DevTools] Sending to extension:', url, '| reqFrames:', requestFrames.length, '| resFrames:', responseFrames.length);
     sendToExtension({
       type: 'grpc-request',
       request: {

@@ -606,6 +606,64 @@ body {
   margin-top: 16px;
 }
 
+/* ─── Proto Schema Section ─── */
+
+.proto-section {
+  border-top: 1px solid var(--border);
+  background: var(--bg-secondary);
+}
+
+.proto-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.proto-title {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.proto-content {
+  padding: 0 12px 10px 12px;
+}
+
+.proto-hint {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  margin-bottom: 6px;
+  line-height: 1.4;
+}
+
+.proto-textarea {
+  width: 100%;
+  min-height: 80px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: var(--mono);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  resize: vertical;
+  outline: none;
+}
+
+.proto-textarea:focus {
+  border-color: var(--accent);
+}
+
+.proto-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+}
+
 /* ─── Scrollbar ─── */
 
 ::-webkit-scrollbar {

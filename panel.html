@@ -64,6 +64,27 @@
           <button class="btn btn-sm" data-action="summarize">Summarize</button>
           <button class="btn btn-sm" data-action="replay">Generate Replay</button>
         </div>
+
+        <!-- Proto Schema Section -->
+        <div class="proto-section" id="protoSection">
+          <div class="proto-header">
+            <span class="proto-title">Proto Schema</span>
+            <button id="protoToggleBtn" class="btn btn-sm btn-ghost">▼</button>
+          </div>
+          <div class="proto-content" id="protoContent" style="display:none;">
+            <p class="proto-hint">Paste JSON mapping to show real field names:</p>
+            <textarea id="protoMapping" class="proto-textarea" placeholder='{
+  "helloworld.Greeter.SayHello": {
+    "request": { "1": "name" },
+    "response": { "1": "message" }
+  }
+}'></textarea>
+            <div class="proto-actions">
+              <button id="protoApplyBtn" class="btn btn-sm btn-primary">Apply</button>
+              <button id="protoClearBtn" class="btn btn-sm">Clear</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>

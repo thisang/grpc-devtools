@@ -264,13 +264,15 @@ function decodeProto(bytes, depth = 0) {
 
 /**
  * Convert decoded fields to a pretty JSON-like structure
+ * Optional fieldMapping: { fieldNumber: fieldName }
  */
-function fieldsToJson(fields) {
+function fieldsToJson(fields, fieldMapping) {
   const result = {};
   for (const field of fields) {
-    const key = `field${field.fieldNumber}`;
+    const fieldNum = field.fieldNumber;
+    const key = fieldMapping && fieldMapping[fieldNum] ? fieldMapping[fieldNum] : ('field' + fieldNum);
     if (field.type === 'message') {
-      const nested = fieldsToJson(field.value);
+      const nested = fieldsToJson(field.value, fieldMapping);
       // Merge repeated fields
       if (key in result) {
         if (Array.isArray(result[key])) {
@@ -298,8 +300,9 @@ function fieldsToJson(fields) {
 
 /**
  * Decode a base64-encoded protobuf frame to JSON
+ * Optional fieldMapping: { fieldNumber: fieldName }
  */
-function decodeBase64Proto(base64Str) {
+function decodeBase64Proto(base64Str, fieldMapping) {
   try {
     const binary = atob(base64Str);
     const bytes = new Uint8Array(binary.length);
@@ -307,7 +310,7 @@ function decodeBase64Proto(base64Str) {
       bytes[i] = binary.charCodeAt(i);
     }
     const fields = decodeProto(bytes, 0);
-    return fieldsToJson(fields);
+    return fieldsToJson(fields, fieldMapping);
   } catch (e) {
     return { _error: 'Failed to decode: ' + e.message };
   }
