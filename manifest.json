@@ -5,9 +5,7 @@
   "description": "Monitor gRPC/gRPC-Web traffic in Chrome DevTools with binary protobuf decoding and AI debugging assistance",
   "minimum_chrome_version": "116",
   "permissions": [
-    "storage",
-    "devtools",
-    "debugger"
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>"
