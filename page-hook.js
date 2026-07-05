@@ -96,14 +96,23 @@
       }
       // Remove whitespace, newlines, and any non-base64 characters
       var cleaned = binary.replace(/[^A-Za-z0-9+/=]/g, '');
+      if (cleaned.length === 0) {
+        console.log('[gRPC DevTools] decodeGrpcWebText: empty after cleaning');
+        return buffer;
+      }
+      // Pad to multiple of 4 if needed
+      while (cleaned.length % 4 !== 0) {
+        cleaned += '=';
+      }
       var decoded = atob(cleaned);
       var result = new Uint8Array(decoded.length);
       for (var i = 0; i < decoded.length; i++) {
         result[i] = decoded.charCodeAt(i);
       }
+      console.log('[gRPC DevTools] decodeGrpcWebText: decoded ' + bytes.length + ' -> ' + result.length + ' bytes');
       return result.buffer;
     } catch (e) {
-      console.log('[gRPC DevTools] decodeGrpcWebText failed, returning raw buffer');
+      console.log('[gRPC DevTools] decodeGrpcWebText failed:', e.message, '- returning raw buffer');
       return buffer;
     }
   }
@@ -115,9 +124,21 @@
     while (offset + 5 <= buffer.byteLength) {
       var compressed = view.getUint8(offset);
       var length = view.getUint32(offset + 1, false);
+      // gRPC frame header: compressed flag must be 0 or 1
+      if (compressed !== 0 && compressed !== 1) {
+        // Not a valid gRPC frame header — treat remaining bytes as raw protobuf
+        console.log('[gRPC DevTools] parseGrpcFrames: invalid compressed flag ' + compressed + ' at offset ' + offset + ', treating as raw protobuf');
+        frames.push({
+          compressed: false,
+          data: arrayBufferToBase64(buffer.slice(offset)),
+          truncated: false
+        });
+        return frames;
+      }
       // Sanity check: if length is unreasonably large, treat as raw protobuf
       if (length > buffer.byteLength - 5) {
         if (offset === 0) {
+          console.log('[gRPC DevTools] parseGrpcFrames: length ' + length + ' > buffer ' + buffer.byteLength + ', treating as raw protobuf');
           frames.push({
             compressed: false,
             data: arrayBufferToBase64(buffer.slice(offset)),
@@ -278,7 +299,10 @@
       if (init.body instanceof ArrayBuffer) {
         requestBodyBuffer = init.body;
       } else if (init.body instanceof Uint8Array) {
-        requestBodyBuffer = init.body.buffer;
+        // CRITICAL: do NOT use init.body.buffer directly — it may be a slice
+        // of a larger shared ArrayBuffer, containing unrelated data before/after.
+        // Always copy to a fresh ArrayBuffer of exactly the right size.
+        requestBodyBuffer = new Uint8Array(init.body).buffer;
       } else if (init.body instanceof Blob) {
         bodyPromise = init.body.arrayBuffer().then(function (buf) { requestBodyBuffer = buf; });
       } else if (typeof init.body === 'string') {
@@ -369,7 +393,8 @@
       if (body instanceof ArrayBuffer) {
         requestBodyBuffer = body;
       } else if (body instanceof Uint8Array) {
-        requestBodyBuffer = body.buffer;
+        // CRITICAL: copy to a fresh ArrayBuffer, same reason as fetch hook
+        requestBodyBuffer = new Uint8Array(body).buffer;
       } else if (body instanceof Blob) {
         var self = this;
         body.arrayBuffer().then(function (buf) { self.__grpc_requestBody = buf; });
