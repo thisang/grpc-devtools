@@ -1,18 +1,14 @@
 /**
  * DevTools panel logic
  * Manages request list, detail view, and AI sidebar
+ *
+ * Connection strategy:
+ *   1. Primary: port.postMessage (real-time push from background)
+ *   2. Fallback: chrome.storage.session polling (survives SW restarts)
+ *   3. On port reconnect → receives full snapshot via 'init' message
  */
-
 (function () {
   'use strict';
-
-  // ─── Global error handler ─────────────────────────────
-  window.addEventListener('error', function (e) {
-    console.error('[gRPC DevTools] PANEL JS ERROR:', e.message, 'at', e.filename, ':', e.lineno);
-  });
-  window.addEventListener('unhandledrejection', function (e) {
-    console.error('[gRPC DevTools] PANEL PROMISE REJECTION:', e.reason);
-  });
 
   // ─── GrpcAI fallback (in case ai.js failed to load) ──
   if (typeof GrpcAI === 'undefined') {
@@ -30,150 +26,209 @@
       quickSummary: function () { return ''; },
       diagnoseError: function () { return []; },
       isConfigured: function () { return false; },
+      loadConfig: function () {},
+      getConfig: function () { return {}; },
+      saveConfig: function () {},
     };
   }
 
   // ─── State ────────────────────────────────────────────────────
-
   let requests = [];
   let selectedRequestId = null;
   let recording = true;
-  let activeTab = 'request'; // request | response | headers | raw
+  let activeTab = 'request';
   let panelPort = null;
-
-  // ─── DOM elements ─────────────────────────────────────────────
-
-  const requestList = document.getElementById('requestList');
-  const detailPanel = document.getElementById('detailPanel');
-  const searchInput = document.getElementById('searchInput');
-  const clearBtn = document.getElementById('clearBtn');
-  const exportBtn = document.getElementById('exportBtn');
-  const aiSearchBtn = document.getElementById('aiSearchBtn');
-  const recordToggle = document.getElementById('recordToggle');
-  const requestCount = document.getElementById('requestCount');
-  const aiContent = document.getElementById('aiContent');
-  const aiActions = document.getElementById('aiActions');
-  const aiConfigBtn = document.getElementById('aiConfigBtn');
-  const aiModal = document.getElementById('aiModal');
-  const aiModalCancel = document.getElementById('aiModalCancel');
-  const aiModalSave = document.getElementById('aiModalSave');
-
-  // ─── Connect to background ────────────────────────────────────
-  //
-  // Push-based architecture: no polling.
-  //   - port.onMessage: real-time updates (new-request, cleared, init)
-  //   - port.onDisconnect: auto-reconnect (SW was killed → restart → init with full snapshot)
-
-  const tabId = chrome.devtools.inspectedWindow.tabId;
-  console.log('[gRPC DevTools] Panel init, tabId:', tabId);
-
+  let tabId = null;
   let reconnectTimer = null;
-  let reconnectDelay = 500; // start at 500ms, back off on repeated failures
+  let reconnectDelay = 500;
+  let pollTimer = null;
 
+  // ─── DOM refs (populated after DOMContentLoaded) ──────────────
+  let requestList, detailPanel, searchInput, clearBtn, exportBtn;
+  let aiSearchBtn, recordToggle, requestCount, aiContent, aiActions;
+  let aiConfigBtn, aiModal, aiModalCancel, aiModalSave, statusBar;
+
+  // ─── Status bar ───────────────────────────────────────────────
+  function setStatus(state, text) {
+    if (!statusBar) return;
+    statusBar.className = 'status-bar status-' + state;
+    var dot = statusBar.querySelector('.status-dot');
+    var label = statusBar.querySelector('.status-text');
+    if (dot) dot.className = 'status-dot';
+    if (label) label.textContent = text;
+  }
+
+  // ─── Connection ───────────────────────────────────────────────
   function connectPort() {
-    console.log('[gRPC DevTools] Panel connecting...');
-    panelPort = chrome.runtime.connect({ name: 'grpc-panel-' + tabId });
+    if (!tabId) {
+      console.error('[gRPC DevTools] No tabId, cannot connect');
+      return;
+    }
 
-    panelPort.onMessage.addListener((msg) => {
-      console.log('[gRPC DevTools] Panel port message:', msg.type, '| requests:', msg.requests?.length);
+    setStatus('connecting', 'Connecting...');
+    console.log('[gRPC DevTools] Panel connecting to tab', tabId);
 
-      if (msg.type === 'init') {
-        const serverRequests = msg.requests || [];
-        console.log('[gRPC DevTools] Panel init: received', serverRequests.length, 'requests');
-        requests = serverRequests;
-        renderRequestList();
-        updateCount();
-      } else if (msg.type === 'new-request') {
-        if (recording) {
-          requests.push(msg.request);
+    try {
+      panelPort = chrome.runtime.connect({ name: 'grpc-panel-' + tabId });
+
+      if (chrome.runtime.lastError) {
+        console.error('[gRPC DevTools] connect() failed:', chrome.runtime.lastError.message);
+        setStatus('error', 'Connection failed: ' + chrome.runtime.lastError.message);
+        scheduleReconnect();
+        startPolling(); // fallback to polling
+        return;
+      }
+    } catch (e) {
+      console.error('[gRPC DevTools] connect() threw:', e);
+      setStatus('error', 'Connection error: ' + e.message);
+      scheduleReconnect();
+      startPolling();
+      return;
+    }
+
+    panelPort.onMessage.addListener(function (msg) {
+      try {
+        console.log('[gRPC DevTools] Panel port message:', msg.type, '| requests:', msg.requests ? msg.requests.length : 'N/A');
+
+        if (msg.type === 'init') {
+          var serverRequests = msg.requests || [];
+          console.log('[gRPC DevTools] Panel init: received', serverRequests.length, 'requests');
+          requests = serverRequests;
           renderRequestList();
           updateCount();
+          setStatus('connected', 'Connected — ' + serverRequests.length + ' requests loaded');
+          stopPolling(); // port is alive, no need to poll
+        } else if (msg.type === 'new-request') {
+          if (recording) {
+            requests.push(msg.request);
+            renderRequestList();
+            updateCount();
+            setStatus('connected', 'Connected — ' + requests.length + ' requests');
+          }
+        } else if (msg.type === 'cleared') {
+          requests = [];
+          renderRequestList();
+          updateCount();
+          renderDetail(null);
+          renderAiInsights(null);
+          setStatus('connected', 'Connected — cleared');
         }
-      } else if (msg.type === 'cleared') {
-        requests = [];
-        renderRequestList();
-        updateCount();
-        renderDetail(null);
-        renderAiInsights(null);
+      } catch (e) {
+        console.error('[gRPC DevTools] Error handling port message:', e);
       }
     });
 
-    panelPort.onDisconnect.addListener(() => {
-      console.log('[gRPC DevTools] Panel port disconnected (SW may have been killed), reconnecting...');
+    panelPort.onDisconnect.addListener(function () {
+      console.log('[gRPC DevTools] Panel port disconnected');
       panelPort = null;
-
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(() => {
-        reconnectDelay = Math.min(reconnectDelay * 1.5, 3000);
-        connectPort();
-      }, reconnectDelay);
+      setStatus('connecting', 'Disconnected — reconnecting...');
+      scheduleReconnect();
+      startPolling(); // port is dead, fall back to polling
     });
 
     reconnectDelay = 500;
   }
 
-  connectPort();
+  function scheduleReconnect() {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(function () {
+      reconnectDelay = Math.min(reconnectDelay * 1.5, 5000);
+      connectPort();
+    }, reconnectDelay);
+  }
 
-  // ─── Load AI config ───────────────────────────────────────────
+  // ─── Polling fallback (only active when port is dead) ─────────
+  function startPolling() {
+    if (pollTimer) return;
+    console.log('[gRPC DevTools] Starting storage polling fallback');
+    pollTimer = setInterval(pollRequests, 2000);
+    pollRequests(); // immediate first poll
+  }
 
-  GrpcAI.loadConfig();
+  function stopPolling() {
+    if (pollTimer) {
+      console.log('[gRPC DevTools] Stopping storage polling (port is alive)');
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function pollRequests() {
+    if (!tabId) return;
+    var key = 'tab-' + tabId;
+
+    chrome.storage.session.get(key, function (result) {
+      if (chrome.runtime.lastError) {
+        console.warn('[gRPC DevTools] storage.session.get failed:', chrome.runtime.lastError.message);
+        return;
+      }
+      var serverRequests = result[key];
+      if (!serverRequests) return;
+
+      if (serverRequests.length !== requests.length) {
+        console.log('[gRPC DevTools] Poll: ' + requests.length + ' → ' + serverRequests.length + ' requests');
+        requests = serverRequests;
+        renderRequestList();
+        updateCount();
+        setStatus('connected', 'Polling — ' + requests.length + ' requests');
+      }
+    });
+  }
 
   // ─── Render functions ─────────────────────────────────────────
-
   function renderRequestList() {
     try {
+      if (!requestList) return;
       if (requests.length === 0) {
-        requestList.innerHTML = `
-          <div class="empty-state">
-            <div class="empty-icon">gRPC</div>
-            <p>No gRPC requests captured yet</p>
-            <p class="hint">Make sure the page is making gRPC / gRPC-Web calls.</p>
-          </div>
-        `;
+        requestList.innerHTML =
+          '<div class="empty-state">' +
+            '<div class="empty-icon">gRPC</div>' +
+            '<p>No gRPC requests captured yet</p>' +
+            '<p class="hint">Make sure the page is making gRPC / gRPC-Web calls.</p>' +
+          '</div>';
         return;
       }
 
-      const html = requests.map(req => {
-        const isSelected = req.id === selectedRequestId;
-        const isError = req.error || (req.grpcStatus && req.grpcStatus.code !== 0) || (req.responseStatus >= 400);
-        const isSuccess = !isError && req.grpcStatus?.code === 0;
-        const statusClass = isError ? 'error' : isSuccess ? 'success' : '';
-        const statusBadgeClass = isError ? 'error' : isSuccess ? 'ok' : 'pending';
+      var html = requests.map(function (req) {
+        var isSelected = req.id === selectedRequestId;
+        var isError = req.error || (req.grpcStatus && req.grpcStatus.code !== 0) || (req.responseStatus >= 400);
+        var isSuccess = !isError && req.grpcStatus && req.grpcStatus.code === 0;
+        var statusClass = isError ? 'error' : isSuccess ? 'success' : '';
+        var statusBadgeClass = isError ? 'error' : isSuccess ? 'ok' : 'pending';
 
-        let statusText = 'OK';
+        var statusText = 'OK';
         if (req.error) {
           statusText = 'ERR';
         } else if (req.grpcStatus) {
-          const info = GrpcAI.GRPC_STATUS_CODES[req.grpcStatus.code];
+          var info = GrpcAI.GRPC_STATUS_CODES[req.grpcStatus.code];
           statusText = info ? info.name : ('c' + req.grpcStatus.code);
         } else if (req.responseStatus >= 400) {
           statusText = String(req.responseStatus);
         }
 
-        return `
-          <div class="request-item ${statusClass} ${isSelected ? 'selected' : ''}" data-id="${req.id}">
-            <div class="request-item-header">
-              <span class="request-method">${req.method || 'POST'}</span>
-              <span class="request-name">${escapeHtml(req.serviceName + '/' + req.methodName)}</span>
-              <span class="request-status ${statusBadgeClass}">${statusText}</span>
-            </div>
-            <div class="request-url">${escapeHtml(req.url)}</div>
-            <div class="request-meta">
-              <span>${req.duration != null ? req.duration.toFixed(0) : '?'}ms</span>
-              <span>${(req.responseFrames || []).length} frames</span>
-            </div>
-          </div>
-        `;
+        return (
+          '<div class="request-item ' + statusClass + (isSelected ? ' selected' : '') + '" data-id="' + req.id + '">' +
+            '<div class="request-item-header">' +
+              '<span class="request-method">' + (req.method || 'POST') + '</span>' +
+              '<span class="request-name">' + escapeHtml(req.serviceName + '/' + req.methodName) + '</span>' +
+              '<span class="request-status ' + statusBadgeClass + '">' + statusText + '</span>' +
+            '</div>' +
+            '<div class="request-url">' + escapeHtml(req.url) + '</div>' +
+            '<div class="request-meta">' +
+              '<span>' + (req.duration != null ? req.duration.toFixed(0) : '?') + 'ms</span>' +
+              '<span>' + ((req.responseFrames || []).length) + ' frames</span>' +
+            '</div>' +
+          '</div>'
+        );
       }).join('');
 
       requestList.innerHTML = html;
 
-      // Attach click handlers
-      requestList.querySelectorAll('.request-item').forEach(el => {
-        el.addEventListener('click', () => {
-          const id = el.dataset.id;
+      requestList.querySelectorAll('.request-item').forEach(function (el) {
+        el.addEventListener('click', function () {
+          var id = el.dataset.id;
           selectedRequestId = id;
-          const req = requests.find(r => r.id === id);
+          var req = requests.find(function (r) { return r.id === id; });
           renderRequestList();
           renderDetail(req);
           renderAiInsights(req);
@@ -181,42 +236,44 @@
       });
     } catch (e) {
       console.error('[gRPC DevTools] renderRequestList error:', e);
-      requestList.innerHTML = `<div class="empty-state"><p>Render error: ${escapeHtml(e.message)}</p></div>`;
+      if (requestList) {
+        requestList.innerHTML = '<div class="empty-state"><p>Render error: ' + escapeHtml(e.message) + '</p></div>';
+      }
     }
   }
 
   function renderDetail(req) {
+    if (!detailPanel) return;
     try {
       if (!req) {
-        detailPanel.innerHTML = `<div class="empty-state"><p>Select a request to view details</p></div>`;
+        detailPanel.innerHTML = '<div class="empty-state"><p>Select a request to view details</p></div>';
         return;
       }
 
-      const reqDecoded = req.requestFrames?.length > 0
+      var reqDecoded = (req.requestFrames && req.requestFrames.length > 0)
         ? decodeBase64Proto(req.requestFrames[0].data)
         : null;
-      const resDecoded = req.responseFrames?.length > 0
+      var resDecoded = (req.responseFrames && req.responseFrames.length > 0)
         ? decodeBase64Proto(req.responseFrames[0].data)
         : null;
 
-      detailPanel.innerHTML = `
-        <div class="detail-header">
-          <div class="detail-title">${escapeHtml(req.serviceName)} / ${escapeHtml(req.methodName)}</div>
-          <div class="detail-url">${escapeHtml(req.url)}</div>
-        </div>
-        <div class="detail-tabs">
-          <div class="detail-tab ${activeTab === 'request' ? 'active' : ''}" data-tab="request">Request</div>
-          <div class="detail-tab ${activeTab === 'response' ? 'active' : ''}" data-tab="response">Response</div>
-          <div class="detail-tab ${activeTab === 'headers' ? 'active' : ''}" data-tab="headers">Headers</div>
-          <div class="detail-tab ${activeTab === 'raw' ? 'active' : ''}" data-tab="raw">Raw</div>
-        </div>
-        <div class="detail-content" id="detailContent"></div>
-      `;
+      detailPanel.innerHTML =
+        '<div class="detail-header">' +
+          '<div class="detail-title">' + escapeHtml(req.serviceName) + ' / ' + escapeHtml(req.methodName) + '</div>' +
+          '<div class="detail-url">' + escapeHtml(req.url) + '</div>' +
+        '</div>' +
+        '<div class="detail-tabs">' +
+          '<div class="detail-tab' + (activeTab === 'request' ? ' active' : '') + '" data-tab="request">Request</div>' +
+          '<div class="detail-tab' + (activeTab === 'response' ? ' active' : '') + '" data-tab="response">Response</div>' +
+          '<div class="detail-tab' + (activeTab === 'headers' ? ' active' : '') + '" data-tab="headers">Headers</div>' +
+          '<div class="detail-tab' + (activeTab === 'raw' ? ' active' : '') + '" data-tab="raw">Raw</div>' +
+        '</div>' +
+        '<div class="detail-content" id="detailContent"></div>';
 
-      detailPanel.querySelectorAll('.detail-tab').forEach(tab => {
-        tab.addEventListener('click', () => {
+      detailPanel.querySelectorAll('.detail-tab').forEach(function (tab) {
+        tab.addEventListener('click', function () {
           activeTab = tab.dataset.tab;
-          detailPanel.querySelectorAll('.detail-tab').forEach(t => t.classList.remove('active'));
+          detailPanel.querySelectorAll('.detail-tab').forEach(function (t) { t.classList.remove('active'); });
           tab.classList.add('active');
           renderTabContent(req, reqDecoded, resDecoded);
         });
@@ -229,60 +286,69 @@
   }
 
   function renderTabContent(req, reqDecoded, resDecoded) {
-    const content = document.getElementById('detailContent');
+    var content = document.getElementById('detailContent');
     if (!content) return;
 
     try {
       if (activeTab === 'request') {
-        content.innerHTML = `
-          <div class="section-title">Decoded request payload</div>
-          ${reqDecoded ? renderJson(reqDecoded) : '<p class="ai-placeholder">No request body</p>'}
-          ${(req.requestFrames || []).length > 1 ? `<div class="section-title">Additional frames (${(req.requestFrames || []).length - 1} more)</div>` : ''}
-        `;
+        content.innerHTML =
+          '<div class="section-title">Decoded request payload</div>' +
+          (reqDecoded ? renderJson(reqDecoded) : '<p class="ai-placeholder">No request body</p>') +
+          ((req.requestFrames || []).length > 1 ? '<div class="section-title">Additional frames (' + ((req.requestFrames || []).length - 1) + ' more)</div>' : '');
       } else if (activeTab === 'response') {
-        let grpcInfo = '';
+        var grpcInfo = '';
         if (req.grpcStatus) {
-          const isOk = req.grpcStatus.code === 0;
-          grpcInfo = `<div class="ai-insight ${isOk ? 'success' : 'error'}">
-            <div class="ai-insight-title">gRPC Status: ${GrpcAI.GRPC_STATUS_CODES[req.grpcStatus.code]?.name || 'Unknown'} (code ${req.grpcStatus.code})</div>
-            ${req.grpcStatus.message ? `<div>${escapeHtml(req.grpcStatus.message)}</div>` : ''}
-          </div>`;
+          var isOk = req.grpcStatus.code === 0;
+          grpcInfo = '<div class="ai-insight ' + (isOk ? 'success' : 'error') + '">' +
+            '<div class="ai-insight-title">gRPC Status: ' + (GrpcAI.GRPC_STATUS_CODES[req.grpcStatus.code] ? GrpcAI.GRPC_STATUS_CODES[req.grpcStatus.code].name : 'Unknown') + ' (code ' + req.grpcStatus.code + ')</div>' +
+            (req.grpcStatus.message ? '<div>' + escapeHtml(req.grpcStatus.message) + '</div>' : '') +
+          '</div>';
         }
-
-        content.innerHTML = `
-          ${grpcInfo}
-          <div class="section-title">Decoded response payload</div>
-          ${resDecoded ? renderJson(resDecoded) : '<p class="ai-placeholder">No response body</p>'}
-          ${(req.responseFrames || []).length > 1 ? `<div class="section-title">Additional frames (${(req.responseFrames || []).length - 1} more)</div>` : ''}
-        `;
+        content.innerHTML =
+          grpcInfo +
+          '<div class="section-title">Decoded response payload</div>' +
+          (resDecoded ? renderJson(resDecoded) : '<p class="ai-placeholder">No response body</p>') +
+          ((req.responseFrames || []).length > 1 ? '<div class="section-title">Additional frames (' + ((req.responseFrames || []).length - 1) + ' more)</div>' : '');
       } else if (activeTab === 'headers') {
-        content.innerHTML = `
-          <div class="section-title">Request headers</div>
-          <table class="headers-table">
-            ${Object.entries(req.requestHeaders || {}).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join('') || '<tr><td colspan="2">No headers</td></tr>'}
-          </table>
-          <div class="section-title">Response headers</div>
-          <table class="headers-table">
-            ${Object.entries(req.responseHeaders || {}).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join('') || '<tr><td colspan="2">No headers</td></tr>'}
-          </table>
-        `;
+        var reqHeaders = '';
+        var reqH = req.requestHeaders || {};
+        var keys = Object.keys(reqH);
+        for (var i = 0; i < keys.length; i++) {
+          reqHeaders += '<tr><td>' + escapeHtml(keys[i]) + '</td><td>' + escapeHtml(String(reqH[keys[i]])) + '</td></tr>';
+        }
+        var resHeaders = '';
+        var resH = req.responseHeaders || {};
+        keys = Object.keys(resH);
+        for (i = 0; i < keys.length; i++) {
+          resHeaders += '<tr><td>' + escapeHtml(keys[i]) + '</td><td>' + escapeHtml(String(resH[keys[i]])) + '</td></tr>';
+        }
+        content.innerHTML =
+          '<div class="section-title">Request headers</div>' +
+          '<table class="headers-table">' + (reqHeaders || '<tr><td colspan="2">No headers</td></tr>') + '</table>' +
+          '<div class="section-title">Response headers</div>' +
+          '<table class="headers-table">' + (resHeaders || '<tr><td colspan="2">No headers</td></tr>') + '</table>';
       } else if (activeTab === 'raw') {
-        content.innerHTML = `
-          <div class="section-title">Request frames (base64)</div>
-          ${(req.requestFrames || []).map((f, i) => `
-            <div class="frame-item">
-              <div class="frame-label">Frame ${i + 1}${f.compressed ? ' (compressed)' : ''}${f.truncated ? ' (truncated)' : ''}</div>
-              <div class="raw-hex">${escapeHtml(f.data.substring(0, 500))}${f.data.length > 500 ? '...' : ''}</div>
-            </div>
-          `).join('') || '<p class="ai-placeholder">No request frames</p>'}
-          <div class="section-title">Response frames (base64)</div>
-          ${(req.responseFrames || []).map((f, i) => `
-            <div class="frame-item">
-              <div class="frame-label">Frame ${i + 1}${f.compressed ? ' (compressed)' : ''}${f.truncated ? ' (truncated)' : ''}</div>
-              <div class="raw-hex">${escapeHtml(f.data.substring(0, 500))}${f.data.length > 500 ? '...' : ''}</div>
-            </div>
-          `).join('') || '<p class="ai-placeholder">No response frames</p>'}
-        `;
+        var reqFramesHtml = '';
+        (req.requestFrames || []).forEach(function (f, i) {
+          reqFramesHtml +=
+            '<div class="frame-item">' +
+              '<div class="frame-label">Frame ' + (i + 1) + (f.compressed ? ' (compressed)' : '') + (f.truncated ? ' (truncated)' : '') + '</div>' +
+              '<div class="raw-hex">' + escapeHtml(f.data.substring(0, 500)) + (f.data.length > 500 ? '...' : '') + '</div>' +
+            '</div>';
+        });
+        var resFramesHtml = '';
+        (req.responseFrames || []).forEach(function (f, i) {
+          resFramesHtml +=
+            '<div class="frame-item">' +
+              '<div class="frame-label">Frame ' + (i + 1) + (f.compressed ? ' (compressed)' : '') + (f.truncated ? ' (truncated)' : '') + '</div>' +
+              '<div class="raw-hex">' + escapeHtml(f.data.substring(0, 500)) + (f.data.length > 500 ? '...' : '') + '</div>' +
+            '</div>';
+        });
+        content.innerHTML =
+          '<div class="section-title">Request frames (base64)</div>' +
+          (reqFramesHtml || '<p class="ai-placeholder">No request frames</p>') +
+          '<div class="section-title">Response frames (base64)</div>' +
+          (resFramesHtml || '<p class="ai-placeholder">No response frames</p>');
       }
     } catch (e) {
       console.error('[gRPC DevTools] renderTabContent error:', e);
@@ -291,182 +357,73 @@
 
   function renderJson(obj) {
     try {
-      const jsonStr = JSON.stringify(obj, null, 2);
-      // Escape HTML entities first
-      let safe = jsonStr
+      var jsonStr = JSON.stringify(obj, null, 2);
+      var safe = jsonStr
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-
-      // Syntax highlight
-      safe = safe.replace(/("(?:\\[\s\S])*?")\s*:/g, '<span class="json-key">$1</span>:')
-        .replace(/"([^"]*)"/g, '<span class="json-string">"$1"</span>')
+      safe = safe.replace(/("(?:\\[^"]|[^"])*?")\s*:/g, '<span class="json-key">$1</span>:')
+        .replace(/("(?:\\[^"]|[^"])*?")/g, '<span class="json-string">$1</span>')
         .replace(/\b(true|false)\b/g, '<span class="json-bool">$1</span>')
         .replace(/\bnull\b/g, '<span class="json-null">null</span>')
-        .replace(/\b(\d+(\.\d+)?)\b/g, '<span class="json-number">$1</span>');
-
-      return `<div class="json-viewer">${safe}</div>`;
+        .replace(/-?\b\d+(\.\d+)?([eE][+-]?\d+)?\b/g, '<span class="json-number">$&</span>');
+      return '<div class="json-viewer">' + safe + '</div>';
     } catch (e) {
-      return `<div class="ai-placeholder">JSON encode error: ${escapeHtml(e.message)}</div>`;
+      return '<div class="ai-placeholder">JSON encode error: ' + escapeHtml(e.message) + '</div>';
     }
   }
 
-  // ─── AI sidebar ───────────────────────────────────────────────
-
   function renderAiInsights(req) {
+    if (!aiContent) return;
     try {
       if (!req) {
         aiContent.innerHTML = '<p class="ai-placeholder">AI-powered debugging insights will appear here. Select a request to get started.</p>';
-        aiActions.style.display = 'none';
+        if (aiActions) aiActions.style.display = 'none';
         return;
       }
-
-      const insights = GrpcAI.diagnoseError(req);
-      aiContent.innerHTML = insights.map(insight => `
-        <div class="ai-insight ${insight.level}">
-          <div class="ai-insight-title">${escapeHtml(insight.title)}</div>
-          <div>${escapeHtml(insight.detail)}</div>
-        </div>
-      `).join('');
-
-      aiActions.style.display = 'flex';
-      aiActions.querySelectorAll('button').forEach(btn => {
-        btn.onclick = () => handleAiAction(btn.dataset.action, req);
+      var insights = GrpcAI.diagnoseError(req);
+      aiContent.innerHTML = insights.map(function (insight) {
+        return '<div class="ai-insight ' + insight.level + '">' +
+          '<div class="ai-insight-title">' + escapeHtml(insight.title) + '</div>' +
+          '<div>' + escapeHtml(insight.detail) + '</div>' +
+        '</div>';
+      }).join('');
+      if (aiActions) aiActions.style.display = 'flex';
+      if (aiActions) aiActions.querySelectorAll('button').forEach(function (btn) {
+        btn.onclick = function () { handleAiAction(btn.dataset.action, req); };
       });
     } catch (e) {
       console.error('[gRPC DevTools] renderAiInsights error:', e);
     }
   }
 
-  async function handleAiAction(action, req) {
+  function handleAiAction(action, req) {
+    if (!aiContent) return;
     if (!GrpcAI.isConfigured()) {
       aiContent.innerHTML = '<div class="ai-insight warning"><div class="ai-insight-title">AI not configured</div><div>Click Settings to configure your AI API key.</div></div>';
       return;
     }
-
     aiContent.innerHTML = '<div class="ai-loading">Analyzing...</div>';
-
     try {
       if (action === 'diagnose') {
-        const insights = await GrpcAI.aiDiagnose(req);
-        aiContent.innerHTML = insights.map(insight => `
-          <div class="ai-insight ${insight.level}">
-            <div class="ai-insight-title">${escapeHtml(insight.title)}</div>
-            <div>${escapeHtml(insight.detail)}</div>
-          </div>
-        `).join('');
-      } else if (action === 'summarize') {
-        const summary = await GrpcAI.aiSummarize(req);
-        aiContent.innerHTML = `<div class="ai-insight info"><div>${escapeHtml(summary)}</div></div>`;
-      } else if (action === 'replay') {
-        const code = await GrpcAI.aiGenerateReplay(req);
-        aiContent.innerHTML = `<div class="ai-insight info"><div class="ai-insight-title">Replay code</div><pre class="json-viewer">${escapeHtml(code)}</pre></div>`;
+        GrpcAI.aiDiagnose(req).then(function (insights) {
+          aiContent.innerHTML = insights.map(function (insight) {
+            return '<div class="ai-insight ' + insight.level + '">' +
+              '<div class="ai-insight-title">' + escapeHtml(insight.title) + '</div>' +
+              '<div>' + escapeHtml(insight.detail) + '</div>' +
+            '</div>';
+          }).join('');
+        }).catch(function (e) {
+          aiContent.innerHTML = '<div class="ai-insight error"><div>AI Error: ' + escapeHtml(e.message) + '</div></div>';
+        });
       }
     } catch (e) {
-      aiContent.innerHTML = `<div class="ai-insight error"><div class="ai-insight-title">AI Error</div><div>${escapeHtml(e.message)}</div></div>`;
+      aiContent.innerHTML = '<div class="ai-insight error"><div>AI Error: ' + escapeHtml(e.message) + '</div></div>';
     }
   }
-
-  // ─── AI config modal ──────────────────────────────────────────
-
-  aiConfigBtn.addEventListener('click', () => {
-    const config = GrpcAI.getConfig();
-    document.getElementById('aiProvider').value = config.provider;
-    document.getElementById('aiApiKey').value = config.apiKey;
-    document.getElementById('aiModel').value = config.model;
-    document.getElementById('aiBaseUrl').value = config.baseUrl;
-    aiModal.style.display = 'flex';
-  });
-
-  aiModalCancel.addEventListener('click', () => {
-    aiModal.style.display = 'none';
-  });
-
-  aiModalSave.addEventListener('click', () => {
-    GrpcAI.saveConfig({
-      provider: document.getElementById('aiProvider').value,
-      apiKey: document.getElementById('aiApiKey').value,
-      model: document.getElementById('aiModel').value,
-      baseUrl: document.getElementById('aiBaseUrl').value,
-    });
-    aiModal.style.display = 'none';
-  });
-
-  // ─── Toolbar actions ──────────────────────────────────────────
-
-  clearBtn.addEventListener('click', () => {
-    const tabId = chrome.devtools.inspectedWindow.tabId;
-    chrome.runtime.sendMessage({ type: 'clear-requests', tabId });
-    requests = [];
-    renderRequestList();
-    updateCount();
-    renderDetail(null);
-    renderAiInsights(null);
-  });
-
-  exportBtn.addEventListener('click', () => {
-    const json = JSON.stringify(requests, null, 2);
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `grpc-requests-${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  });
-
-  recordToggle.addEventListener('change', (e) => {
-    recording = e.target.checked;
-  });
-
-  aiSearchBtn.addEventListener('click', async () => {
-    const query = searchInput.value.trim();
-    if (!query) return;
-
-    if (!GrpcAI.isConfigured()) {
-      filterRequests(query);
-      return;
-    }
-
-    aiContent.innerHTML = '<div class="ai-loading">Searching...</div>';
-    try {
-      const matchingIds = await GrpcAI.aiSearch(query, requests);
-      requestList.querySelectorAll('.request-item').forEach(el => {
-        if (matchingIds.includes(el.dataset.id)) {
-          el.style.outline = '2px solid var(--accent)';
-        } else {
-          el.style.outline = '';
-        }
-      });
-      aiContent.innerHTML = `<div class="ai-insight info"><div>Found ${matchingIds.length} matching requests</div></div>`;
-    } catch (e) {
-      aiContent.innerHTML = `<div class="ai-insight error"><div>Search failed: ${escapeHtml(e.message)}</div></div>`;
-    }
-  });
-
-  searchInput.addEventListener('input', (e) => {
-    const query = e.target.value.trim().toLowerCase();
-    if (!query) {
-      requestList.querySelectorAll('.request-item').forEach(el => {
-        el.style.display = '';
-        el.style.outline = '';
-      });
-      return;
-    }
-    filterRequests(query);
-  });
-
-  function filterRequests(query) {
-    requestList.querySelectorAll('.request-item').forEach(el => {
-      const text = el.textContent.toLowerCase();
-      el.style.display = text.includes(query) ? '' : 'none';
-    });
-  }
-
-  // ─── Utils ────────────────────────────────────────────────────
 
   function updateCount() {
-    requestCount.textContent = String(requests.length);
+    if (requestCount) requestCount.textContent = String(requests.length);
   }
 
   function escapeHtml(str) {
@@ -478,11 +435,155 @@
       .replace(/"/g, '&quot;');
   }
 
-  // Load CSS via JS (panel.html can't use <link> in some contexts)
-  const link = document.createElement('link');
-  link.rel = 'stylesheet';
-  link.href = 'panel.css';
-  document.head.appendChild(link);
+  // ─── Init on DOM ready ────────────────────────────────────────
+  function init() {
+    // Grab DOM refs
+    requestList = document.getElementById('requestList');
+    detailPanel = document.getElementById('detailPanel');
+    searchInput = document.getElementById('searchInput');
+    clearBtn = document.getElementById('clearBtn');
+    exportBtn = document.getElementById('exportBtn');
+    aiSearchBtn = document.getElementById('aiSearchBtn');
+    recordToggle = document.getElementById('recordToggle');
+    requestCount = document.getElementById('requestCount');
+    aiContent = document.getElementById('aiContent');
+    aiActions = document.getElementById('aiActions');
+    aiConfigBtn = document.getElementById('aiConfigBtn');
+    aiModal = document.getElementById('aiModal');
+    aiModalCancel = document.getElementById('aiModalCancel');
+    aiModalSave = document.getElementById('aiModalSave');
+    statusBar = document.getElementById('statusBar');
 
-  console.log('[gRPC DevTools] Panel initialized OK');
+    console.log('[gRPC DevTools] DOM ready, elements found:',
+      'requestList=' + !!requestList,
+      'detailPanel=' + !!detailPanel,
+      'statusBar=' + !!statusBar
+    );
+
+    // Tab ID
+    tabId = chrome.devtools.inspectedWindow.tabId;
+    console.log('[gRPC DevTools] Panel init, tabId:', tabId);
+
+    if (!tabId) {
+      console.error('[gRPC DevTools] No tabId! inspectedWindow:', chrome.devtools.inspectedWindow);
+      setStatus('error', 'No tabId — cannot monitor');
+      return;
+    }
+
+    // AI config
+    GrpcAI.loadConfig();
+
+    // Connect to background
+    connectPort();
+
+    // ─── Toolbar events ──────────────────────────────────────
+    if (clearBtn) {
+      clearBtn.addEventListener('click', function () {
+        chrome.runtime.sendMessage({ type: 'clear-requests', tabId: tabId });
+        requests = [];
+        renderRequestList();
+        updateCount();
+        renderDetail(null);
+        renderAiInsights(null);
+      });
+    }
+
+    if (exportBtn) {
+      exportBtn.addEventListener('click', function () {
+        var json = JSON.stringify(requests, null, 2);
+        var blob = new Blob([json], { type: 'application/json' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'grpc-requests-' + Date.now() + '.json';
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+    }
+
+    if (recordToggle) {
+      recordToggle.addEventListener('change', function (e) {
+        recording = e.target.checked;
+      });
+    }
+
+    if (aiSearchBtn) {
+      aiSearchBtn.addEventListener('click', function () {
+        if (!searchInput) return;
+        var query = searchInput.value.trim();
+        if (!query) return;
+        filterRequests(query);
+      });
+    }
+
+    if (searchInput) {
+      searchInput.addEventListener('input', function () {
+        var query = searchInput.value.trim().toLowerCase();
+        requestList.querySelectorAll('.request-item').forEach(function (el) {
+          var text = el.textContent.toLowerCase();
+          el.style.display = text.indexOf(query) >= 0 ? '' : 'none';
+        });
+      });
+    }
+
+    // ─── AI config modal ─────────────────────────────────────
+    if (aiConfigBtn && aiModal) {
+      aiConfigBtn.addEventListener('click', function () {
+        var config = GrpcAI.getConfig();
+        var providerEl = document.getElementById('aiProvider');
+        var apiKeyEl = document.getElementById('aiApiKey');
+        var modelEl = document.getElementById('aiModel');
+        var baseUrlEl = document.getElementById('aiBaseUrl');
+        if (providerEl) providerEl.value = config.provider || 'openai';
+        if (apiKeyEl) apiKeyEl.value = config.apiKey || '';
+        if (modelEl) modelEl.value = config.model || 'gpt-4o-mini';
+        if (baseUrlEl) baseUrlEl.value = config.baseUrl || '';
+        aiModal.style.display = 'flex';
+      });
+    }
+
+    if (aiModalCancel && aiModal) {
+      aiModalCancel.addEventListener('click', function () {
+        aiModal.style.display = 'none';
+      });
+    }
+
+    if (aiModalSave && aiModal) {
+      aiModalSave.addEventListener('click', function () {
+        GrpcAI.saveConfig({
+          provider: document.getElementById('aiProvider').value,
+          apiKey: document.getElementById('aiApiKey').value,
+          model: document.getElementById('aiModel').value,
+          baseUrl: document.getElementById('aiBaseUrl').value,
+        });
+        aiModal.style.display = 'none';
+      });
+    }
+
+    console.log('[gRPC DevTools] Panel initialized OK');
+  }
+
+  function filterRequests(query) {
+    if (!requestList) return;
+    requestList.querySelectorAll('.request-item').forEach(function (el) {
+      var text = el.textContent.toLowerCase();
+      el.style.display = text.indexOf(query) >= 0 ? '' : 'none';
+    });
+  }
+
+  // Start when DOM is ready
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+  // Global error handlers
+  window.addEventListener('error', function (e) {
+    console.error('[gRPC DevTools] PANEL ERROR:', e.message, 'at', e.filename, ':', e.lineno);
+  });
+
+  window.addEventListener('unhandledrejection', function (e) {
+    console.error('[gRPC DevTools] PANEL REJECTION:', e.reason);
+  });
 })();

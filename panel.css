@@ -625,3 +625,38 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-tertiary);
 }
+
+/* ─── Status bar ─── */
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  font-size: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-connecting { background: #fffbeb; }
+.status-connecting .status-dot { background: var(--warning); animation: pulse 1.2s infinite; }
+.status-connecting .status-text { color: #92400e; }
+
+.status-connected { background: #f0fdf4; }
+.status-connected .status-dot { background: var(--success); }
+.status-connected .status-text { color: #166534; }
+
+.status-error { background: #fef2f2; }
+.status-error .status-dot { background: var(--error); }
+.status-error .status-text { color: #991b1b; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
