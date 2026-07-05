@@ -135,10 +135,11 @@
   }
 
   function sendToExtension(data) {
+    console.log('[gRPC DevTools] sendToExtension:', data.type, data.request?.url);
     try {
       window.postMessage({ source: 'grpc-devtools', payload: data }, '*');
     } catch (e) {
-      // silently fail
+      console.warn('[gRPC DevTools] postMessage failed:', e);
     }
   }
 
@@ -153,7 +154,11 @@
   }
 
   function processResponse(url, method, requestHeaders, requestBody, response) {
-    if (!isGrpcRequest(url, requestHeaders, response.headers)) return;
+    var isGrpc = isGrpcRequest(url, requestHeaders, response.headers);
+    console.log('[gRPC DevTools] processResponse:', url, '| isGrpc:', isGrpc,
+      '| resCT:', response.headers['content-type'],
+      '| reqCT:', requestHeaders['content-type']);
+    if (!isGrpc) return;
 
     var rawBody = response.body;
     if (isGrpcWebText(response.headers['content-type'])) {
@@ -249,6 +254,9 @@
     return bodyPromise.then(function () {
       return originalFetch.apply(this, arguments);
     }.bind(this)).then(function (response) {
+      console.log('[gRPC DevTools] fetch response:', url, '| status:', response.status,
+        '| resCT:', response.headers.get('content-type'),
+        '| isGrpc:', isGrpcRequest(url, requestHeaders, null));
       if (!isGrpcRequest(url, requestHeaders, null)) return response;
 
       var cloned = response.clone();
@@ -356,7 +364,12 @@
         // ignore
       }
 
-      if (!isGrpcRequest(url, requestHeaders, responseHeaders)) return;
+      if (!isGrpcRequest(url, requestHeaders, responseHeaders)) {
+        console.log('[gRPC DevTools] XHR loadend, not gRPC:', url, '| resCT:', responseHeaders['content-type'], '| reqCT:', requestHeaders['content-type']);
+        return;
+      }
+
+      console.log('[gRPC DevTools] XHR loadend, IS gRPC:', url, '| resCT:', responseHeaders['content-type']);
 
       var bodyBuffer;
       try {
@@ -371,7 +384,10 @@
         // ignore
       }
 
-      if (!bodyBuffer) return;
+      if (!bodyBuffer) {
+        console.log('[gRPC DevTools] XHR: no body buffer, responseType:', xhrSelf.responseType);
+        return;
+      }
 
       processResponse(url, method, requestHeaders, xhrSelf.__grpc_requestBody, {
         status: xhrSelf.status,

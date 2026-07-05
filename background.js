@@ -14,17 +14,22 @@ const panelPorts = new Map();
 const MAX_REQUESTS = 500;
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name === 'grpc-devtools-panel') {
-    const tabId = port.sender?.tab?.id;
-    if (tabId == null) return;
+  console.log('[gRPC DevTools] BG: connection received, name:', port.name);
+
+  // DevTools panel connection: name = "grpc-panel-<tabId>"
+  if (port.name.startsWith('grpc-panel-')) {
+    const tabId = parseInt(port.name.replace('grpc-panel-', ''), 10);
+    console.log('[gRPC DevTools] BG: panel connected for tabId:', tabId);
 
     panelPorts.set(tabId, port);
 
     // Send existing requests for this tab
     const existing = tabRequests.get(tabId) || [];
+    console.log('[gRPC DevTools] BG: sending init with', existing.length, 'requests to tab', tabId);
     port.postMessage({ type: 'init', requests: existing });
 
     port.onDisconnect.addListener(() => {
+      console.log('[gRPC DevTools] BG: panel disconnected for tabId:', tabId);
       panelPorts.delete(tabId);
     });
   }
@@ -32,12 +37,18 @@ chrome.runtime.onConnect.addListener((port) => {
 
 // Receive captured requests from content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  console.log('[gRPC DevTools] BG: onMessage:', message.type, 'from tab:', sender.tab?.id);
+
   if (message.type === 'grpc-request') {
     const tabId = sender.tab?.id;
-    if (tabId == null) return;
+    if (tabId == null) {
+      console.warn('[gRPC DevTools] BG: no tabId in sender, dropping request');
+      return;
+    }
 
     const requests = tabRequests.get(tabId) || [];
     requests.push(message.request);
+    console.log('[gRPC DevTools] BG: stored request for tab', tabId, 'total:', requests.length, 'url:', message.request.url);
 
     // Trim if too many
     if (requests.length > MAX_REQUESTS) {
@@ -48,7 +59,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Forward to connected panel
     const port = panelPorts.get(tabId);
     if (port) {
+      console.log('[gRPC DevTools] BG: forwarding to panel for tab', tabId);
       port.postMessage({ type: 'new-request', request: message.request });
+    } else {
+      console.log('[gRPC DevTools] BG: no panel connected for tab', tabId, '(will show when panel opens)');
     }
 
     sendResponse({ ok: true });

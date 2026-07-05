@@ -25,17 +25,23 @@
     var payload = event.data.payload;
     if (!payload) return;
 
+    console.log('[gRPC DevTools] Isolated: received postMessage, type:', payload.type);
+
     if (payload.type === 'grpc-request') {
+      console.log('[gRPC DevTools] Isolated: forwarding request to background:', payload.request.url);
       try {
         chrome.runtime.sendMessage({
           type: 'grpc-request',
           request: payload.request
         }, function () {
-          // Swallow lastError — panel might not be open
-          void chrome.runtime.lastError;
+          if (chrome.runtime.lastError) {
+            console.warn('[gRPC DevTools] Isolated: sendMessage error:', chrome.runtime.lastError.message);
+          } else {
+            console.log('[gRPC DevTools] Isolated: sendMessage success');
+          }
         });
       } catch (e) {
-        console.warn('[gRPC DevTools] Failed to forward capture:', e);
+        console.warn('[gRPC DevTools] Isolated: failed to forward capture:', e);
       }
     }
   });

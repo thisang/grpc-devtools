@@ -34,18 +34,25 @@
   // ─── Connect to background ────────────────────────────────────
 
   function connectPort() {
-    panelPort = chrome.runtime.connect({ name: 'grpc-devtools-panel' });
+    const tabId = chrome.devtools.inspectedWindow.tabId;
+    console.log('[gRPC DevTools] Panel connecting for tabId:', tabId);
+    panelPort = chrome.runtime.connect({ name: 'grpc-panel-' + tabId });
 
     panelPort.onMessage.addListener((msg) => {
+      console.log('[gRPC DevTools] Panel received message:', msg.type, msg);
       if (msg.type === 'init') {
         requests = msg.requests || [];
+        console.log('[gRPC DevTools] Panel init with', requests.length, 'existing requests');
         renderRequestList();
         updateCount();
       } else if (msg.type === 'new-request') {
         if (recording) {
           requests.push(msg.request);
+          console.log('[gRPC DevTools] New request received, total:', requests.length, msg.request.url);
           renderRequestList();
           updateCount();
+        } else {
+          console.log('[gRPC DevTools] Skipped (not recording)');
         }
       } else if (msg.type === 'cleared') {
         requests = [];
@@ -56,7 +63,7 @@
     });
 
     panelPort.onDisconnect.addListener(() => {
-      // Reconnect after a delay
+      console.log('[gRPC DevTools] Panel disconnected, reconnecting...');
       setTimeout(connectPort, 1000);
     });
   }
