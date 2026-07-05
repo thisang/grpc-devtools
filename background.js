@@ -1,7 +1,17 @@
 /**
  * Background service worker
- * Stores captured gRPC requests in chrome.storage.session (survives SW restarts)
- * Forwards to DevTools panel via port if connected
+ *
+ * Architecture:
+ *   page-hook.js (MAIN world) → window.postMessage → content.js (ISOLATED)
+ *   content.js → chrome.runtime.sendMessage → background (here)
+ *   background → port.postMessage → panel.js (DevTools)
+ *
+ * Storage:
+ *   chrome.storage.session — used ONLY to survive SW restarts.
+ *   When a panel reconnects (after SW was killed), it gets a full
+ *   snapshot from storage.session via the 'init' message.
+ *
+ * No polling. All updates are push-based via port.postMessage.
  */
 
 const MAX_REQUESTS = 500;
@@ -17,10 +27,14 @@ chrome.runtime.onConnect.addListener((port) => {
     console.log('[gRPC DevTools] BG: panel connected for tabId:', tabId);
     panelPorts.set(tabId, port);
 
-    // Send existing requests for this tab
+    // Send full snapshot from storage.session (covers SW restart recovery)
     getRequests(tabId).then((existing) => {
       console.log('[gRPC DevTools] BG: sending init with', existing.length, 'requests to tab', tabId);
-      port.postMessage({ type: 'init', requests: existing });
+      try {
+        port.postMessage({ type: 'init', requests: existing });
+      } catch (e) {
+        console.warn('[gRPC DevTools] BG: init postMessage failed:', e);
+      }
     });
 
     port.onDisconnect.addListener(() => {
@@ -46,10 +60,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     storeRequest(tabId, message.request).then(() => {
       console.log('[gRPC DevTools] BG: stored request for tab', tabId, 'url:', message.request.url);
 
-      // Try to forward via port (instant update)
+      // Push to panel via port (real-time, no polling)
       const port = panelPorts.get(tabId);
       if (port) {
-        console.log('[gRPC DevTools] BG: forwarding to panel for tab', tabId);
+        console.log('[gRPC DevTools] BG: pushing to panel for tab', tabId);
         try {
           port.postMessage({ type: 'new-request', request: message.request });
         } catch (e) {
@@ -57,7 +71,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           panelPorts.delete(tabId);
         }
       } else {
-        console.log('[gRPC DevTools] BG: no panel for tab', tabId, '(panel will pick it up via polling)');
+        console.log('[gRPC DevTools] BG: no panel connected for tab', tabId, '(request stored, will be sent on panel connect)');
       }
     });
 
@@ -65,20 +79,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message.type === 'get-requests') {
-    const tabId = message.tabId;
-    getRequests(tabId).then((requests) => {
-      console.log('[gRPC DevTools] BG: get-requests for tab', tabId, '→', requests.length, 'requests');
-      sendResponse({ requests });
-    });
-    return true; // async
-  }
-
   if (message.type === 'clear-requests') {
     const tabId = message.tabId;
     chrome.storage.session.set({ ['tab-' + tabId]: [] }).then(() => {
       const port = panelPorts.get(tabId);
-      if (port) port.postMessage({ type: 'cleared' });
+      if (port) {
+        try {
+          port.postMessage({ type: 'cleared' });
+        } catch (e) {
+          console.warn('[gRPC DevTools] BG: clear postMessage failed:', e);
+        }
+      }
       sendResponse({ ok: true });
     });
     return true;
