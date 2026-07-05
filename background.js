@@ -53,10 +53,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (tabId == null) {
       console.warn('[gRPC DevTools] BG: no tabId, dropping');
       sendResponse({ ok: false });
-      return true;
+      return false; // sync response, don't keep channel open
     }
 
-    // Store in chrome.storage.session (survives SW restart)
+    // Store first, then push to panel, then respond — all async.
+    // return true keeps the SW alive until sendResponse is called.
     storeRequest(tabId, message.request).then(() => {
       console.log('[gRPC DevTools] BG: stored request for tab', tabId, 'url:', message.request.url);
 
@@ -71,12 +72,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           panelPorts.delete(tabId);
         }
       } else {
-        console.log('[gRPC DevTools] BG: no panel connected for tab', tabId, '(request stored, will be sent on panel connect)');
+        console.log('[gRPC DevTools] BG: no panel connected for tab', tabId, '(stored, will send on connect)');
       }
+
+      sendResponse({ ok: true });
+    }).catch((err) => {
+      console.error('[gRPC DevTools] BG: storeRequest failed:', err);
+      sendResponse({ ok: false, error: err.message });
     });
 
-    sendResponse({ ok: true });
-    return true;
+    return true; // keep channel open for async sendResponse
   }
 
   if (message.type === 'clear-requests') {
@@ -94,6 +99,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+
+  return false;
 });
 
 // ─── Storage helpers ──────────────────────────────────────────
