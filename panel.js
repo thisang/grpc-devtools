@@ -6,6 +6,33 @@
 (function () {
   'use strict';
 
+  // ─── Global error handler ─────────────────────────────
+  window.addEventListener('error', function (e) {
+    console.error('[gRPC DevTools] PANEL JS ERROR:', e.message, 'at', e.filename, ':', e.lineno);
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    console.error('[gRPC DevTools] PANEL PROMISE REJECTION:', e.reason);
+  });
+
+  // ─── GrpcAI fallback (in case ai.js failed to load) ──
+  if (typeof GrpcAI === 'undefined') {
+    console.warn('[gRPC DevTools] GrpcAI not loaded, using fallback');
+    window.GrpcAI = {
+      GRPC_STATUS_CODES: {
+        0: { name: 'OK' }, 1: { name: 'CANCELLED' }, 2: { name: 'UNKNOWN' },
+        3: { name: 'INVALID_ARGUMENT' }, 4: { name: 'DEADLINE_EXCEEDED' },
+        5: { name: 'NOT_FOUND' }, 6: { name: 'ALREADY_EXISTS' },
+        7: { name: 'PERMISSION_DENIED' }, 8: { name: 'RESOURCE_EXHAUSTED' },
+        9: { name: 'ABORTED' }, 10: { name: 'OUT_OF_RANGE' },
+        11: { name: 'UNIMPLEMENTED' }, 12: { name: 'INTERNAL' },
+        13: { name: 'UNAVAILABLE' }, 14: { name: 'DATA_LOSS' }, 15: { name: 'UNAUTHENTICATED' },
+      },
+      quickSummary: function () { return ''; },
+      diagnoseError: function () { return []; },
+      isConfigured: function () { return false; },
+    };
+  }
+
   // ─── State ────────────────────────────────────────────────────
 
   let requests = [];
@@ -48,10 +75,9 @@
     panelPort = chrome.runtime.connect({ name: 'grpc-panel-' + tabId });
 
     panelPort.onMessage.addListener((msg) => {
-      console.log('[gRPC DevTools] Panel port message:', msg.type);
+      console.log('[gRPC DevTools] Panel port message:', msg.type, '| requests:', msg.requests?.length);
 
       if (msg.type === 'init') {
-        // Full snapshot from background (on connect or after SW restart)
         const serverRequests = msg.requests || [];
         console.log('[gRPC DevTools] Panel init: received', serverRequests.length, 'requests');
         requests = serverRequests;
@@ -76,17 +102,13 @@
       console.log('[gRPC DevTools] Panel port disconnected (SW may have been killed), reconnecting...');
       panelPort = null;
 
-      // Auto-reconnect with backoff.
-      // On reconnect, background sends 'init' with full snapshot from
-      // chrome.storage.session, so no data is lost.
       if (reconnectTimer) clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(() => {
-        reconnectDelay = Math.min(reconnectDelay * 1.5, 3000); // cap at 3s
+        reconnectDelay = Math.min(reconnectDelay * 1.5, 3000);
         connectPort();
       }, reconnectDelay);
     });
 
-    // Reset backoff on successful connect
     reconnectDelay = 500;
   }
 
@@ -99,211 +121,226 @@
   // ─── Render functions ─────────────────────────────────────────
 
   function renderRequestList() {
-    if (requests.length === 0) {
-      requestList.innerHTML = `
-        <div class="empty-state">
-          <div class="empty-icon">gRPC</div>
-          <p>No gRPC requests captured yet</p>
-          <p class="hint">Make sure the page is making gRPC / gRPC-Web calls. The extension automatically intercepts fetch and XHR traffic.</p>
-        </div>
-      `;
-      return;
-    }
-
-    const html = requests.map(req => {
-      const isSelected = req.id === selectedRequestId;
-      const isError = req.error || (req.grpcStatus && req.grpcStatus.code !== 0) || (req.responseStatus >= 400);
-      const isSuccess = !isError && req.grpcStatus?.code === 0;
-      const statusClass = isError ? 'error' : isSuccess ? 'success' : '';
-      const statusText = req.error
-        ? 'ERR'
-        : req.grpcStatus
-          ? GrpcAI.GRPC_STATUS_CODES[req.grpcStatus.code]?.name || `c${req.grpcStatus.code}`
-          : req.responseStatus >= 400 ? `${req.responseStatus}` : 'OK';
-      const statusBadgeClass = isError ? 'error' : isSuccess ? 'ok' : 'pending';
-
-      const summary = GrpcAI.quickSummary(req);
-
-      return `
-        <div class="request-item ${statusClass} ${isSelected ? 'selected' : ''}" data-id="${req.id}">
-          <div class="request-item-header">
-            <span class="request-method">${req.method || 'POST'}</span>
-            <span class="request-name">${req.serviceName}/${req.methodName}</span>
-            <span class="request-status ${statusBadgeClass}">${statusText}</span>
+    try {
+      if (requests.length === 0) {
+        requestList.innerHTML = `
+          <div class="empty-state">
+            <div class="empty-icon">gRPC</div>
+            <p>No gRPC requests captured yet</p>
+            <p class="hint">Make sure the page is making gRPC / gRPC-Web calls.</p>
           </div>
-          <div class="request-url">${escapeHtml(req.url)}</div>
-          <div class="request-meta">
-            <span>${req.duration?.toFixed(0) || '?'}ms</span>
-            <span>${req.responseFrames?.length || 0} frames</span>
+        `;
+        return;
+      }
+
+      const html = requests.map(req => {
+        const isSelected = req.id === selectedRequestId;
+        const isError = req.error || (req.grpcStatus && req.grpcStatus.code !== 0) || (req.responseStatus >= 400);
+        const isSuccess = !isError && req.grpcStatus?.code === 0;
+        const statusClass = isError ? 'error' : isSuccess ? 'success' : '';
+        const statusBadgeClass = isError ? 'error' : isSuccess ? 'ok' : 'pending';
+
+        let statusText = 'OK';
+        if (req.error) {
+          statusText = 'ERR';
+        } else if (req.grpcStatus) {
+          const info = GrpcAI.GRPC_STATUS_CODES[req.grpcStatus.code];
+          statusText = info ? info.name : ('c' + req.grpcStatus.code);
+        } else if (req.responseStatus >= 400) {
+          statusText = String(req.responseStatus);
+        }
+
+        return `
+          <div class="request-item ${statusClass} ${isSelected ? 'selected' : ''}" data-id="${req.id}">
+            <div class="request-item-header">
+              <span class="request-method">${req.method || 'POST'}</span>
+              <span class="request-name">${escapeHtml(req.serviceName + '/' + req.methodName)}</span>
+              <span class="request-status ${statusBadgeClass}">${statusText}</span>
+            </div>
+            <div class="request-url">${escapeHtml(req.url)}</div>
+            <div class="request-meta">
+              <span>${req.duration != null ? req.duration.toFixed(0) : '?'}ms</span>
+              <span>${(req.responseFrames || []).length} frames</span>
+            </div>
           </div>
-        </div>
-      `;
-    }).join('');
+        `;
+      }).join('');
 
-    requestList.innerHTML = html;
+      requestList.innerHTML = html;
 
-    // Attach click handlers
-    requestList.querySelectorAll('.request-item').forEach(el => {
-      el.addEventListener('click', () => {
-        const id = el.dataset.id;
-        selectedRequestId = id;
-        const req = requests.find(r => r.id === id);
-        renderRequestList();
-        renderDetail(req);
-        renderAiInsights(req);
+      // Attach click handlers
+      requestList.querySelectorAll('.request-item').forEach(el => {
+        el.addEventListener('click', () => {
+          const id = el.dataset.id;
+          selectedRequestId = id;
+          const req = requests.find(r => r.id === id);
+          renderRequestList();
+          renderDetail(req);
+          renderAiInsights(req);
+        });
       });
-    });
+    } catch (e) {
+      console.error('[gRPC DevTools] renderRequestList error:', e);
+      requestList.innerHTML = `<div class="empty-state"><p>Render error: ${escapeHtml(e.message)}</p></div>`;
+    }
   }
 
   function renderDetail(req) {
-    if (!req) {
-      detailPanel.innerHTML = `<div class="empty-state"><p>Select a request to view details</p></div>`;
-      return;
-    }
+    try {
+      if (!req) {
+        detailPanel.innerHTML = `<div class="empty-state"><p>Select a request to view details</p></div>`;
+        return;
+      }
 
-    const reqDecoded = req.requestFrames?.length > 0
-      ? decodeBase64Proto(req.requestFrames[0].data)
-      : null;
-    const resDecoded = req.responseFrames?.length > 0
-      ? decodeBase64Proto(req.responseFrames[0].data)
-      : null;
+      const reqDecoded = req.requestFrames?.length > 0
+        ? decodeBase64Proto(req.requestFrames[0].data)
+        : null;
+      const resDecoded = req.responseFrames?.length > 0
+        ? decodeBase64Proto(req.responseFrames[0].data)
+        : null;
 
-    detailPanel.innerHTML = `
-      <div class="detail-header">
-        <div class="detail-title">${escapeHtml(req.serviceName)} / ${escapeHtml(req.methodName)}</div>
-        <div class="detail-url">${escapeHtml(req.url)}</div>
-      </div>
-      <div class="detail-tabs">
-        <div class="detail-tab ${activeTab === 'request' ? 'active' : ''}" data-tab="request">Request</div>
-        <div class="detail-tab ${activeTab === 'response' ? 'active' : ''}" data-tab="response">Response</div>
-        <div class="detail-tab ${activeTab === 'headers' ? 'active' : ''}" data-tab="headers">Headers</div>
-        <div class="detail-tab ${activeTab === 'raw' ? 'active' : ''}" data-tab="raw">Raw</div>
-      </div>
-      <div class="detail-content" id="detailContent"></div>
-    `;
+      detailPanel.innerHTML = `
+        <div class="detail-header">
+          <div class="detail-title">${escapeHtml(req.serviceName)} / ${escapeHtml(req.methodName)}</div>
+          <div class="detail-url">${escapeHtml(req.url)}</div>
+        </div>
+        <div class="detail-tabs">
+          <div class="detail-tab ${activeTab === 'request' ? 'active' : ''}" data-tab="request">Request</div>
+          <div class="detail-tab ${activeTab === 'response' ? 'active' : ''}" data-tab="response">Response</div>
+          <div class="detail-tab ${activeTab === 'headers' ? 'active' : ''}" data-tab="headers">Headers</div>
+          <div class="detail-tab ${activeTab === 'raw' ? 'active' : ''}" data-tab="raw">Raw</div>
+        </div>
+        <div class="detail-content" id="detailContent"></div>
+      `;
 
-    // Tab switching
-    detailPanel.querySelectorAll('.detail-tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        activeTab = tab.dataset.tab;
-        detailPanel.querySelectorAll('.detail-tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        renderTabContent(req, reqDecoded, resDecoded);
+      detailPanel.querySelectorAll('.detail-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+          activeTab = tab.dataset.tab;
+          detailPanel.querySelectorAll('.detail-tab').forEach(t => t.classList.remove('active'));
+          tab.classList.add('active');
+          renderTabContent(req, reqDecoded, resDecoded);
+        });
       });
-    });
 
-    renderTabContent(req, reqDecoded, resDecoded);
+      renderTabContent(req, reqDecoded, resDecoded);
+    } catch (e) {
+      console.error('[gRPC DevTools] renderDetail error:', e);
+    }
   }
 
   function renderTabContent(req, reqDecoded, resDecoded) {
     const content = document.getElementById('detailContent');
     if (!content) return;
 
-    if (activeTab === 'request') {
-      content.innerHTML = `
-        <div class="section-title">Decoded request payload</div>
-        ${reqDecoded ? renderJson(reqDecoded) : '<p class="ai-placeholder">No request body</p>'}
-        ${req.requestFrames?.length > 1 ? `<div class="section-title">Additional frames (${req.requestFrames.length - 1} more)</div>` : ''}
-      `;
-    } else if (activeTab === 'response') {
-      const grpcInfo = req.grpcStatus
-        ? `<div class="ai-insight ${req.grpcStatus.code === 0 ? 'success' : 'error'}">
+    try {
+      if (activeTab === 'request') {
+        content.innerHTML = `
+          <div class="section-title">Decoded request payload</div>
+          ${reqDecoded ? renderJson(reqDecoded) : '<p class="ai-placeholder">No request body</p>'}
+          ${(req.requestFrames || []).length > 1 ? `<div class="section-title">Additional frames (${(req.requestFrames || []).length - 1} more)</div>` : ''}
+        `;
+      } else if (activeTab === 'response') {
+        let grpcInfo = '';
+        if (req.grpcStatus) {
+          const isOk = req.grpcStatus.code === 0;
+          grpcInfo = `<div class="ai-insight ${isOk ? 'success' : 'error'}">
             <div class="ai-insight-title">gRPC Status: ${GrpcAI.GRPC_STATUS_CODES[req.grpcStatus.code]?.name || 'Unknown'} (code ${req.grpcStatus.code})</div>
             ${req.grpcStatus.message ? `<div>${escapeHtml(req.grpcStatus.message)}</div>` : ''}
-          </div>`
-        : '';
+          </div>`;
+        }
 
-      content.innerHTML = `
-        ${grpcInfo}
-        <div class="section-title">Decoded response payload</div>
-        ${resDecoded ? renderJson(resDecoded) : '<p class="ai-placeholder">No response body</p>'}
-        ${req.responseFrames?.length > 1 ? `<div class="section-title">Additional frames (${req.responseFrames.length - 1} more)</div>` : ''}
-      `;
-    } else if (activeTab === 'headers') {
-      content.innerHTML = `
-        <div class="section-title">Request headers</div>
-        <table class="headers-table">
-          ${Object.entries(req.requestHeaders || {}).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join('') || '<tr><td colspan="2">No headers</td></tr>'}
-        </table>
-        <div class="section-title">Response headers</div>
-        <table class="headers-table">
-          ${Object.entries(req.responseHeaders || {}).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join('') || '<tr><td colspan="2">No headers</td></tr>'}
-        </table>
-      `;
-    } else if (activeTab === 'raw') {
-      content.innerHTML = `
-        <div class="section-title">Request frames (base64)</div>
-        ${(req.requestFrames || []).map((f, i) => `
-          <div class="frame-item">
-            <div class="frame-label">Frame ${i + 1}${f.compressed ? ' (compressed)' : ''}${f.truncated ? ' (truncated)' : ''}</div>
-            <div class="raw-hex">${escapeHtml(f.data.substring(0, 500))}${f.data.length > 500 ? '...' : ''}</div>
-          </div>
-        `).join('') || '<p class="ai-placeholder">No request frames</p>'}
-        <div class="section-title">Response frames (base64)</div>
-        ${(req.responseFrames || []).map((f, i) => `
-          <div class="frame-item">
-            <div class="frame-label">Frame ${i + 1}${f.compressed ? ' (compressed)' : ''}${f.truncated ? ' (truncated)' : ''}</div>
-            <div class="raw-hex">${escapeHtml(f.data.substring(0, 500))}${f.data.length > 500 ? '...' : ''}</div>
-          </div>
-        `).join('') || '<p class="ai-placeholder">No response frames</p>'}
-      `;
+        content.innerHTML = `
+          ${grpcInfo}
+          <div class="section-title">Decoded response payload</div>
+          ${resDecoded ? renderJson(resDecoded) : '<p class="ai-placeholder">No response body</p>'}
+          ${(req.responseFrames || []).length > 1 ? `<div class="section-title">Additional frames (${(req.responseFrames || []).length - 1} more)</div>` : ''}
+        `;
+      } else if (activeTab === 'headers') {
+        content.innerHTML = `
+          <div class="section-title">Request headers</div>
+          <table class="headers-table">
+            ${Object.entries(req.requestHeaders || {}).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join('') || '<tr><td colspan="2">No headers</td></tr>'}
+          </table>
+          <div class="section-title">Response headers</div>
+          <table class="headers-table">
+            ${Object.entries(req.responseHeaders || {}).map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(String(v))}</td></tr>`).join('') || '<tr><td colspan="2">No headers</td></tr>'}
+          </table>
+        `;
+      } else if (activeTab === 'raw') {
+        content.innerHTML = `
+          <div class="section-title">Request frames (base64)</div>
+          ${(req.requestFrames || []).map((f, i) => `
+            <div class="frame-item">
+              <div class="frame-label">Frame ${i + 1}${f.compressed ? ' (compressed)' : ''}${f.truncated ? ' (truncated)' : ''}</div>
+              <div class="raw-hex">${escapeHtml(f.data.substring(0, 500))}${f.data.length > 500 ? '...' : ''}</div>
+            </div>
+          `).join('') || '<p class="ai-placeholder">No request frames</p>'}
+          <div class="section-title">Response frames (base64)</div>
+          ${(req.responseFrames || []).map((f, i) => `
+            <div class="frame-item">
+              <div class="frame-label">Frame ${i + 1}${f.compressed ? ' (compressed)' : ''}${f.truncated ? ' (truncated)' : ''}</div>
+              <div class="raw-hex">${escapeHtml(f.data.substring(0, 500))}${f.data.length > 500 ? '...' : ''}</div>
+            </div>
+          `).join('') || '<p class="ai-placeholder">No response frames</p>'}
+        `;
+      }
+    } catch (e) {
+      console.error('[gRPC DevTools] renderTabContent error:', e);
     }
   }
 
-  function renderJson(obj, indent = 0) {
-    const jsonStr = JSON.stringify(obj, null, 2);
-    const highlighted = jsonStr
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, (match) => {
-        let cls = 'json-number';
-        if (/^"/.test(match)) {
-          if (/:$/.test(match)) {
-            cls = 'json-key';
-          } else {
-            cls = 'json-string';
-          }
-        } else if (/true|false/.test(match)) {
-          cls = 'json-bool';
-        } else if (/null/.test(match)) {
-          cls = 'json-null';
-        }
-        return `<span class="${cls}">${match}</span>`;
-      });
+  function renderJson(obj) {
+    try {
+      const jsonStr = JSON.stringify(obj, null, 2);
+      // Escape HTML entities first
+      let safe = jsonStr
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 
-    return `<div class="json-viewer">${highlighted}</div>`;
+      // Syntax highlight
+      safe = safe.replace(/("(?:\\[\s\S])*?")\s*:/g, '<span class="json-key">$1</span>:')
+        .replace(/"([^"]*)"/g, '<span class="json-string">"$1"</span>')
+        .replace(/\b(true|false)\b/g, '<span class="json-bool">$1</span>')
+        .replace(/\bnull\b/g, '<span class="json-null">null</span>')
+        .replace(/\b(\d+(\.\d+)?)\b/g, '<span class="json-number">$1</span>');
+
+      return `<div class="json-viewer">${safe}</div>`;
+    } catch (e) {
+      return `<div class="ai-placeholder">JSON encode error: ${escapeHtml(e.message)}</div>`;
+    }
   }
 
   // ─── AI sidebar ───────────────────────────────────────────────
 
   function renderAiInsights(req) {
-    if (!req) {
-      aiContent.innerHTML = '<p class="ai-placeholder">AI-powered debugging insights will appear here. Select a request to get started.</p>';
-      aiActions.style.display = 'none';
-      return;
+    try {
+      if (!req) {
+        aiContent.innerHTML = '<p class="ai-placeholder">AI-powered debugging insights will appear here. Select a request to get started.</p>';
+        aiActions.style.display = 'none';
+        return;
+      }
+
+      const insights = GrpcAI.diagnoseError(req);
+      aiContent.innerHTML = insights.map(insight => `
+        <div class="ai-insight ${insight.level}">
+          <div class="ai-insight-title">${escapeHtml(insight.title)}</div>
+          <div>${escapeHtml(insight.detail)}</div>
+        </div>
+      `).join('');
+
+      aiActions.style.display = 'flex';
+      aiActions.querySelectorAll('button').forEach(btn => {
+        btn.onclick = () => handleAiAction(btn.dataset.action, req);
+      });
+    } catch (e) {
+      console.error('[gRPC DevTools] renderAiInsights error:', e);
     }
-
-    // Show built-in diagnostics immediately
-    const insights = GrpcAI.diagnoseError(req);
-    aiContent.innerHTML = insights.map(insight => `
-      <div class="ai-insight ${insight.level}">
-        <div class="ai-insight-title">${escapeHtml(insight.title)}</div>
-        <div>${escapeHtml(insight.detail)}</div>
-      </div>
-    `).join('');
-
-    aiActions.style.display = 'flex';
-
-    // Attach action handlers
-    aiActions.querySelectorAll('button').forEach(btn => {
-      btn.onclick = () => handleAiAction(btn.dataset.action, req);
-    });
   }
 
   async function handleAiAction(action, req) {
     if (!GrpcAI.isConfigured()) {
-      aiContent.innerHTML = '<div class="ai-insight warning"><div class="ai-insight-title">AI not configured</div><div>Click Settings to configure your AI API key for advanced features.</div></div>';
+      aiContent.innerHTML = '<div class="ai-insight warning"><div class="ai-insight-title">AI not configured</div><div>Click Settings to configure your AI API key.</div></div>';
       return;
     }
 
@@ -382,13 +419,11 @@
     recording = e.target.checked;
   });
 
-  // AI search
   aiSearchBtn.addEventListener('click', async () => {
     const query = searchInput.value.trim();
     if (!query) return;
 
     if (!GrpcAI.isConfigured()) {
-      // Fall back to simple text search
       filterRequests(query);
       return;
     }
@@ -396,7 +431,6 @@
     aiContent.innerHTML = '<div class="ai-loading">Searching...</div>';
     try {
       const matchingIds = await GrpcAI.aiSearch(query, requests);
-      // Highlight matching requests
       requestList.querySelectorAll('.request-item').forEach(el => {
         if (matchingIds.includes(el.dataset.id)) {
           el.style.outline = '2px solid var(--accent)';
@@ -444,11 +478,11 @@
       .replace(/"/g, '&quot;');
   }
 
-  // Fix: panel.html uses <style src=...>, need to load CSS via JS
+  // Load CSS via JS (panel.html can't use <link> in some contexts)
   const link = document.createElement('link');
   link.rel = 'stylesheet';
   link.href = 'panel.css';
   document.head.appendChild(link);
 
-  console.log('[gRPC DevTools] Panel initialized');
+  console.log('[gRPC DevTools] Panel initialized OK');
 })();

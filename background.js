@@ -20,84 +20,107 @@ const MAX_REQUESTS = 500;
 const panelPorts = new Map();
 
 chrome.runtime.onConnect.addListener((port) => {
-  console.log('[gRPC DevTools] BG: connection, name:', port.name);
+  try {
+    console.log('[gRPC DevTools] BG: connection, name:', port.name);
 
-  if (port.name.startsWith('grpc-panel-')) {
-    const tabId = parseInt(port.name.replace('grpc-panel-', ''), 10);
+    if (!port.name || !port.name.startsWith('grpc-panel-')) {
+      console.log('[gRPC DevTools] BG: ignoring non-panel connection:', port.name);
+      return;
+    }
+
+    const tabIdStr = port.name.replace('grpc-panel-', '');
+    const tabId = parseInt(tabIdStr, 10);
+    if (isNaN(tabId)) {
+      console.warn('[gRPC DevTools] BG: invalid tabId in port name:', port.name);
+      return;
+    }
+
     console.log('[gRPC DevTools] BG: panel connected for tabId:', tabId);
     panelPorts.set(tabId, port);
 
-    // Send full snapshot from storage.session (covers SW restart recovery)
+    // Send full snapshot from storage.session.
+    // Use sendResponse pattern: send init message, and also store the port.
     getRequests(tabId).then((existing) => {
       console.log('[gRPC DevTools] BG: sending init with', existing.length, 'requests to tab', tabId);
       try {
         port.postMessage({ type: 'init', requests: existing });
       } catch (e) {
         console.warn('[gRPC DevTools] BG: init postMessage failed:', e);
+        panelPorts.delete(tabId);
       }
+    }).catch((err) => {
+      console.error('[gRPC DevTools] BG: getRequests failed:', err);
     });
 
     port.onDisconnect.addListener(() => {
       console.log('[gRPC DevTools] BG: panel disconnected for tabId:', tabId);
       panelPorts.delete(tabId);
     });
+  } catch (e) {
+    console.error('[gRPC DevTools] BG: error in onConnect handler:', e);
   }
 });
 
 // Receive captured requests from content scripts
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  console.log('[gRPC DevTools] BG: onMessage:', message.type, 'from tab:', sender.tab?.id);
+  try {
+    console.log('[gRPC DevTools] BG: onMessage:', message.type, 'from tab:', sender.tab?.id);
 
-  if (message.type === 'grpc-request') {
-    const tabId = sender.tab?.id;
-    if (tabId == null) {
-      console.warn('[gRPC DevTools] BG: no tabId, dropping');
-      sendResponse({ ok: false });
-      return false; // sync response, don't keep channel open
+    if (message.type === 'grpc-request') {
+      const tabId = sender.tab?.id;
+      if (tabId == null) {
+        console.warn('[gRPC DevTools] BG: no tabId, dropping');
+        sendResponse({ ok: false, error: 'no tabId' });
+        return false;
+      }
+
+      // Store + push + respond. return true to keep channel open.
+      storeRequest(tabId, message.request).then(() => {
+        console.log('[gRPC DevTools] BG: stored request for tab', tabId, 'url:', message.request.url);
+
+        const port = panelPorts.get(tabId);
+        if (port) {
+          console.log('[gRPC DevTools] BG: pushing new-request to panel for tab', tabId);
+          try {
+            port.postMessage({ type: 'new-request', request: message.request });
+          } catch (e) {
+            console.warn('[gRPC DevTools] BG: port.postMessage failed:', e);
+            panelPorts.delete(tabId);
+          }
+        } else {
+          console.log('[gRPC DevTools] BG: no panel connected for tab', tabId, '(stored, will send on connect)');
+        }
+
+        sendResponse({ ok: true });
+      }).catch((err) => {
+        console.error('[gRPC DevTools] BG: storeRequest failed:', err);
+        try { sendResponse({ ok: false, error: err.message }); } catch (e) { /* ignore */ }
+      });
+
+      return true; // keep channel open
     }
 
-    // Store first, then push to panel, then respond — all async.
-    // return true keeps the SW alive until sendResponse is called.
-    storeRequest(tabId, message.request).then(() => {
-      console.log('[gRPC DevTools] BG: stored request for tab', tabId, 'url:', message.request.url);
-
-      // Push to panel via port (real-time, no polling)
-      const port = panelPorts.get(tabId);
-      if (port) {
-        console.log('[gRPC DevTools] BG: pushing to panel for tab', tabId);
-        try {
-          port.postMessage({ type: 'new-request', request: message.request });
-        } catch (e) {
-          console.warn('[gRPC DevTools] BG: port.postMessage failed:', e);
-          panelPorts.delete(tabId);
+    if (message.type === 'clear-requests') {
+      const tabId = message.tabId;
+      chrome.storage.session.set({ ['tab-' + tabId]: [] }).then(() => {
+        const port = panelPorts.get(tabId);
+        if (port) {
+          try {
+            port.postMessage({ type: 'cleared' });
+          } catch (e) {
+            console.warn('[gRPC DevTools] BG: clear postMessage failed:', e);
+          }
         }
-      } else {
-        console.log('[gRPC DevTools] BG: no panel connected for tab', tabId, '(stored, will send on connect)');
-      }
-
-      sendResponse({ ok: true });
-    }).catch((err) => {
-      console.error('[gRPC DevTools] BG: storeRequest failed:', err);
-      sendResponse({ ok: false, error: err.message });
-    });
-
-    return true; // keep channel open for async sendResponse
-  }
-
-  if (message.type === 'clear-requests') {
-    const tabId = message.tabId;
-    chrome.storage.session.set({ ['tab-' + tabId]: [] }).then(() => {
-      const port = panelPorts.get(tabId);
-      if (port) {
-        try {
-          port.postMessage({ type: 'cleared' });
-        } catch (e) {
-          console.warn('[gRPC DevTools] BG: clear postMessage failed:', e);
-        }
-      }
-      sendResponse({ ok: true });
-    });
-    return true;
+        sendResponse({ ok: true });
+      }).catch((err) => {
+        console.error('[gRPC DevTools] BG: clear failed:', err);
+        try { sendResponse({ ok: false, error: err.message }); } catch (e) { /* ignore */ }
+      });
+      return true;
+    }
+  } catch (e) {
+    console.error('[gRPC DevTools] BG: error in onMessage handler:', e);
+    try { sendResponse({ ok: false, error: e.message }); } catch (ignored) { /* ignore */ }
   }
 
   return false;
@@ -115,7 +138,6 @@ async function storeRequest(tabId, request) {
   const key = 'tab-' + tabId;
   const requests = await getRequests(tabId);
   requests.push(request);
-  // Trim
   if (requests.length > MAX_REQUESTS) {
     requests.splice(0, requests.length - MAX_REQUESTS);
   }
