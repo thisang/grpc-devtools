@@ -12,9 +12,34 @@
   window.__GRPC_DEVTOOLS_HOOKED__ = true;
 
   const CONTENT_TYPE_GRPC = 'application/grpc';
+  const CONTENT_TYPE_GRPC_PROTO = 'application/grpc+proto';
+  const CONTENT_TYPE_GRPC_JSON = 'application/grpc+json';
   const CONTENT_TYPE_GRPC_WEB = 'application/grpc-web';
   const CONTENT_TYPE_GRPC_WEB_PROTO = 'application/grpc-web+proto';
   const CONTENT_TYPE_GRPC_WEB_TEXT = 'application/grpc-web-text';
+  const CONTENT_TYPE_CONNECT_PROTO = 'application/connect+proto';
+  const CONTENT_TYPE_CONNECT_JSON = 'application/connect+json';
+  const CONTENT_TYPE_PROTO = 'application/proto';
+  const CONTENT_TYPE_PROTOBUF = 'application/x-protobuf';
+
+  const GRPC_CONTENT_TYPES = new Set([
+    CONTENT_TYPE_GRPC,
+    CONTENT_TYPE_GRPC_PROTO,
+    CONTENT_TYPE_GRPC_JSON,
+    CONTENT_TYPE_GRPC_WEB,
+    CONTENT_TYPE_GRPC_WEB_PROTO,
+    CONTENT_TYPE_GRPC_WEB_TEXT,
+    CONTENT_TYPE_CONNECT_PROTO,
+    CONTENT_TYPE_CONNECT_JSON,
+    CONTENT_TYPE_PROTO,
+    CONTENT_TYPE_PROTOBUF,
+  ]);
+
+  const GRPC_WEB_TEXT_TYPES = new Set([
+    CONTENT_TYPE_GRPC_WEB_TEXT,
+  ]);
+
+  const DEBUG = false; // Set to true for verbose console logging
 
   /**
    * Check if a content-type header indicates gRPC traffic
@@ -22,12 +47,16 @@
   function isGrpcContentType(contentType) {
     if (!contentType) return false;
     const ct = contentType.toLowerCase().split(';')[0].trim();
-    return (
-      ct === CONTENT_TYPE_GRPC ||
-      ct === CONTENT_TYPE_GRPC_WEB ||
-      ct === CONTENT_TYPE_GRPC_WEB_PROTO ||
-      ct === CONTENT_TYPE_GRPC_WEB_TEXT
-    );
+    return GRPC_CONTENT_TYPES.has(ct);
+  }
+
+  /**
+   * Check if content-type indicates grpc-web-text (base64 encoded)
+   */
+  function isGrpcWebText(contentType) {
+    if (!contentType) return false;
+    const ct = contentType.toLowerCase().split(';')[0].trim();
+    return GRPC_WEB_TEXT_TYPES.has(ct);
   }
 
   /**
@@ -43,11 +72,49 @@
         const methodPart = parts[parts.length - 1];
         // Service names usually contain a dot: package.ServiceName
         if (servicePart.includes('.')) return true;
+        // Method names often start with uppercase (gRPC convention)
+        if (/^[A-Z]/.test(methodPart) && /^[A-Za-z]/.test(servicePart)) return true;
       }
       return false;
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Check if the headers suggest binary/protobuf payload
+   */
+  function hasBinaryHeaders(headers) {
+    if (!headers) return false;
+    const ct = (headers['content-type'] || '').toLowerCase();
+    // Also check for accept headers
+    const accept = (headers['accept'] || '').toLowerCase();
+    return (
+      ct.includes('proto') ||
+      ct.includes('grpc') ||
+      ct.includes('octet-stream') ||
+      accept.includes('grpc') ||
+      accept.includes('proto')
+    );
+  }
+
+  /**
+   * Combined check: is this likely a gRPC call?
+   */
+  function isGrpcRequest(url, requestHeaders, responseHeaders) {
+    const resCt = responseHeaders?.['content-type'];
+    const reqCt = requestHeaders?.['content-type'];
+
+    // Exact content-type match
+    if (isGrpcContentType(resCt) || isGrpcContentType(reqCt)) return true;
+
+    // Path-based heuristic
+    if (looksLikeGrpcPath(url)) return true;
+
+    // Binary headers + method=POST on a non-RESTful path
+    if (hasBinaryHeaders(requestHeaders) && looksLikeGrpcPath(url)) return true;
+
+    return false;
   }
 
   /**
@@ -147,8 +214,9 @@
         type: 'grpc-request',
         request: record,
       });
+      if (DEBUG) console.debug('[gRPC DevTools] Captured request:', record.serviceName + '/' + record.methodName, record.url);
     } catch (e) {
-      // Extension context may be invalidated
+      console.warn('[gRPC DevTools] Failed to send capture:', e);
     }
   }
 
@@ -157,16 +225,15 @@
    */
   function processResponse(url, method, requestHeaders, requestBody, response) {
     // response: { status, statusText, headers, body (ArrayBuffer) }
-    const isGrpc =
-      isGrpcContentType(response.headers['content-type']) ||
-      isGrpcContentType(requestHeaders['content-type']) ||
-      looksLikeGrpcPath(url);
+    const isGrpc = isGrpcRequest(url, requestHeaders, response.headers);
 
-    if (!isGrpc) return;
+    if (!isGrpc) {
+      if (DEBUG) console.debug('[gRPC DevTools] Skipped non-gRPC request:', url);
+      return;
+    }
 
     let rawBody = response.body;
-    if (isGrpcContentType(response.headers['content-type']) &&
-        response.headers['content-type'].includes('grpc-web-text')) {
+    if (isGrpcWebText(response.headers['content-type'])) {
       rawBody = decodeGrpcWebText(rawBody);
     }
 
@@ -177,8 +244,7 @@
     let requestFrames = [];
     if (requestBody) {
       let reqRaw = requestBody;
-      if (requestHeaders['content-type'] &&
-          requestHeaders['content-type'].includes('grpc-web-text')) {
+      if (isGrpcWebText(requestHeaders['content-type'])) {
         reqRaw = decodeGrpcWebText(requestBody);
       }
       requestFrames = parseGrpcFrames(reqRaw);
@@ -258,10 +324,7 @@
       const cloned = response.clone();
       const contentType = response.headers.get('content-type') || '';
 
-      const isGrpc =
-        isGrpcContentType(contentType) ||
-        isGrpcContentType(requestHeaders['content-type']) ||
-        looksLikeGrpcPath(url);
+      const isGrpc = isGrpcRequest(url, requestHeaders, null);
 
       if (isGrpc) {
         try {
@@ -276,15 +339,15 @@
             body: bodyBuffer,
             duration: performance.now() - startTime,
           });
-        } catch {
-          // Body read failed, skip
+        } catch (err) {
+          console.warn('[gRPC DevTools] Failed to process gRPC response:', err);
         }
       }
 
       return response;
     } catch (err) {
       // If it's a gRPC request that errored, capture the error
-      if (looksLikeGrpcPath(url) || isGrpcContentType(requestHeaders['content-type'])) {
+      if (isGrpcRequest(url, requestHeaders, null)) {
         captureRequest({
           id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           timestamp: Date.now(),
@@ -358,14 +421,7 @@
       const method = self.__grpc_method;
       const requestHeaders = self.__grpc_requestHeaders || {};
 
-      const isGrpc =
-        isGrpcContentType(self.getResponseHeader('content-type')) ||
-        isGrpcContentType(requestHeaders['content-type']) ||
-        looksLikeGrpcPath(url);
-
-      if (!isGrpc) return;
-
-      // Get response headers
+      // Get response headers first
       const responseHeaders = {};
       const rawHeaders = self.getAllResponseHeaders();
       if (rawHeaders) {
@@ -376,6 +432,10 @@
           }
         });
       }
+
+      const isGrpc = isGrpcRequest(url, requestHeaders, responseHeaders);
+
+      if (!isGrpc) return;
 
       // Get response body as ArrayBuffer
       let bodyBuffer;
@@ -405,5 +465,5 @@
     return originalSend.call(this, body);
   };
 
-  console.log('[gRPC DevTools] Content script hooks installed');
+  console.log('[gRPC DevTools] Content script hooks installed. Supported content-types:', [...GRPC_CONTENT_TYPES].join(', '));
 })();
