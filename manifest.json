@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "gRPC DevTools Monitor",
+  "version": "0.1.0",
+  "description": "Monitor gRPC/gRPC-Web traffic in Chrome DevTools with binary protobuf decoding and AI debugging assistance",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "storage",
+    "devtools",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "devtools_page": "devtools.html",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": false,
+      "world": "MAIN"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

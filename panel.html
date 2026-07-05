@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>gRPC DevTools</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Toolbar -->
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <button id="clearBtn" class="btn btn-sm" title="Clear all captured requests">Clear</button>
+        <button id="exportBtn" class="btn btn-sm" title="Export requests as JSON">Export</button>
+      </div>
+      <div class="toolbar-center">
+        <input type="text" id="searchInput" class="search-input" placeholder="Search or ask AI: 'find all failed requests'">
+        <button id="aiSearchBtn" class="btn btn-sm btn-primary" title="Ask AI to filter requests">AI Search</button>
+      </div>
+      <div class="toolbar-right">
+        <label class="toggle">
+          <input type="checkbox" id="recordToggle" checked>
+          <span>Record</span>
+        </label>
+        <span id="requestCount" class="count-badge">0</span>
+      </div>
+    </div>
+
+    <!-- Main content: split view -->
+    <div class="main-content">
+      <!-- Request list -->
+      <div class="request-list" id="requestList">
+        <div class="empty-state">
+          <div class="empty-icon">gRPC</div>
+          <p>No gRPC requests captured yet</p>
+          <p class="hint">Make sure the page is making gRPC / gRPC-Web calls. The extension automatically intercepts fetch and XHR traffic.</p>
+        </div>
+      </div>
+
+      <!-- Detail panel -->
+      <div class="detail-panel" id="detailPanel">
+        <div class="empty-state">
+          <p>Select a request to view details</p>
+        </div>
+      </div>
+
+      <!-- AI Sidebar -->
+      <div class="ai-sidebar" id="aiSidebar">
+        <div class="ai-header">
+          <span class="ai-title">AI Assistant</span>
+          <button id="aiConfigBtn" class="btn btn-sm btn-ghost" title="Configure AI API key">Settings</button>
+        </div>
+        <div class="ai-content" id="aiContent">
+          <p class="ai-placeholder">AI-powered debugging insights will appear here. Select a request to get started.</p>
+        </div>
+        <div class="ai-actions" id="aiActions" style="display:none;">
+          <button class="btn btn-sm btn-primary" data-action="diagnose">Diagnose</button>
+          <button class="btn btn-sm" data-action="summarize">Summarize</button>
+          <button class="btn btn-sm" data-action="replay">Generate Replay</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI Settings Modal -->
+  <div class="modal-overlay" id="aiModal" style="display:none;">
+    <div class="modal">
+      <h2>AI Configuration</h2>
+      <p class="modal-desc">Configure your AI provider to enable intelligent debugging features. Your API key is stored locally and never sent anywhere except the provider.</p>
+      <div class="form-group">
+        <label>Provider</label>
+        <select id="aiProvider">
+          <option value="openai">OpenAI</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="custom">Custom (OpenAI-compatible)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>API Key</label>
+        <input type="password" id="aiApiKey" placeholder="sk-...">
+      </div>
+      <div class="form-group">
+        <label>Model</label>
+        <input type="text" id="aiModel" placeholder="gpt-4o-mini" value="gpt-4o-mini">
+      </div>
+      <div class="form-group">
+        <label>API Base URL (optional)</label>
+        <input type="text" id="aiBaseUrl" placeholder="https://api.openai.com/v1">
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="aiModalCancel">Cancel</button>
+        <button class="btn btn-primary" id="aiModalSave">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="decoder.js"></script>
+  <script src="ai.js"></script>
+  <script src="panel.js"></script>
+</body>
+</html>
